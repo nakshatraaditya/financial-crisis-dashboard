@@ -1,16 +1,15 @@
+# app.py
 # ======================================================================
 #  FINANCIAL CRISIS EARLY WARNING SYSTEM – STREAMLIT DASHBOARD
-#  Multi-Model, Tabs, SHAP, Heatmaps, Regime Segmentation
+#  Multi-Model Pipeline (USA, UK, Canada)
+#  Based on your final dissertation-ready modelling code
 # ======================================================================
 
-import matplotlib
-matplotlib.use("Agg")  # non-interactive backend for Streamlit
-import matplotlib.pyplot as plt
-import seaborn as sns
 import streamlit as st
 import pandas as pd
 import numpy as np
-import shap
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
@@ -24,26 +23,14 @@ from sklearn.metrics import (
 )
 from sklearn.preprocessing import StandardScaler
 
+import shap
 import warnings
 warnings.filterwarnings("ignore")
 
 # ----------------------------------------------------------------------
-# PAGE CONFIG
+# 1. CORE PIPELINE FUNCTIONS (your logic, wrapped for Streamlit)
 # ----------------------------------------------------------------------
-st.set_page_config(
-    page_title="Financial Crisis Early Warning System",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
 
-st.title("📉 Financial Crisis Early Warning Dashboard")
-st.markdown(
-    "Early-warning system for **USA, UK, and Canada**, using macro-financial indicators and multiple ML models."
-)
-
-# ----------------------------------------------------------------------
-# 1. DATA LOADING
-# ----------------------------------------------------------------------
 @st.cache_data
 def load_data(file="JSTdatasetR6.xlsx"):
     df = pd.read_excel(file)
@@ -51,29 +38,27 @@ def load_data(file="JSTdatasetR6.xlsx"):
     df = df.sort_values(["country", "year"])
     return df
 
-# ----------------------------------------------------------------------
-# 2. FEATURE ENGINEERING
-# ----------------------------------------------------------------------
+
 def engineer_features(df):
     df = df.copy()
 
     df["leverage_risk"] = 1 / (df["lev"] + 0.01)
 
     def expanding_z(df_inner, col):
-        def _z(series):
-            m = series.expanding().mean()
-            sd = series.expanding().std().replace(0, np.nan)
-            return (series - m) / (sd + 1e-9)
-        return df_inner.groupby("country")[col].transform(_z)
+        def z(s):
+            mu = s.expanding().mean()
+            sd = s.expanding().std().replace(0, np.nan)
+            return (s - mu) / (sd + 1e-9)
+        return df_inner.groupby("country")[col].transform(z)
 
     df["noncore_z"] = expanding_z(df, "noncore")
     df["ltd_z"] = expanding_z(df, "ltd")
     df["leverage_z"] = expanding_z(df, "leverage_risk")
 
     df["banking_fragility"] = (
-        0.4 * df["noncore_z"] +
-        0.3 * df["ltd_z"] +
-        0.3 * df["leverage_z"]
+        0.4 * df["noncore_z"]
+        + 0.3 * df["ltd_z"]
+        + 0.3 * df["leverage_z"]
     )
 
     df["hp_real"] = df["hpnom"] / df["cpi"]
@@ -87,13 +72,8 @@ def engineer_features(df):
 
     df["yield_curve"] = df["ltrate"] - df["stir"]
 
-    us_ltrate = (
-        df[df["country"] == "USA"]
-        .drop_duplicates("year")
-        .set_index("year")["ltrate"]
-        .to_dict()
-    )
-    df["us_ltrate"] = df["year"].map(us_ltrate)
+    us_ltrate = df[df["country"] == "USA"].drop_duplicates("year").set_index("year")["ltrate"]
+    df["us_ltrate"] = df["year"].map(us_ltrate.to_dict())
     df["sovereign_spread"] = df["ltrate"] - df["us_ltrate"]
 
     df["money_gdp"] = df["money"] / df["gdp"]
@@ -101,21 +81,20 @@ def engineer_features(df):
 
     df["ca_gdp"] = df["ca"] / df["gdp"]
 
-    features = [
+    feature_list = [
         "housing_bubble", "credit_growth", "banking_fragility",
-        "sovereign_spread", "yield_curve",
-        "money_expansion", "ca_gdp",
+        "sovereign_spread", "yield_curve", "money_expansion", "ca_gdp"
     ]
 
-    df = df[["country", "year", "crisisJST"] + features]
+    df = df[["country", "year", "crisisJST"] + feature_list].copy()
     df = df.replace([np.inf, -np.inf], np.nan)
-    return df, features
 
-# ----------------------------------------------------------------------
-# 3. CLEANING (CAUSAL IMPUTATION)
-# ----------------------------------------------------------------------
+    return df, feature_list
+
+
 def clean_data(df):
     df = df.copy()
+
     df = df[~df["year"].between(1914, 1918)]
     df = df[~df["year"].between(1939, 1945)]
 
@@ -125,17 +104,16 @@ def clean_data(df):
         df[f"{col}_missing"] = df[col].isna().astype(int)
 
     df[features] = df.groupby("country")[features].transform(
-        lambda s: s.ffill(limit=3).bfill(limit=3)
+        lambda x: x.ffill(limit=3).bfill(limit=3)
     )
+
     df[features] = df.groupby("country")[features].transform(
-        lambda s: s.fillna(s.median())
+        lambda x: x.fillna(x.median())
     )
 
     return df
 
-# ----------------------------------------------------------------------
-# 4. TARGET VARIABLE – Crisis in next 2 years
-# ----------------------------------------------------------------------
+
 def create_target(df):
     df = df.copy()
     df["target"] = (
@@ -148,62 +126,92 @@ def create_target(df):
     df["target"] = df["target"].astype(int)
     return df
 
-# ----------------------------------------------------------------------
-# 5. BUILD MODEL SET
-# ----------------------------------------------------------------------
+
 def build_model_set():
     return {
         "Logistic Regression (Rare Event)": LogisticRegression(
-            penalty="l2",
-            solver="lbfgs",
-            max_iter=5000
+            penalty="l2", solver="lbfgs", max_iter=5000
         ),
         "Random Forest": RandomForestClassifier(
-            n_estimators=600,
-            max_depth=4,
-            min_samples_leaf=5,
-            class_weight="balanced_subsample",
-            random_state=42
+            n_estimators=600, max_depth=4, min_samples_leaf=5,
+            class_weight="balanced_subsample", random_state=42
         ),
         "Gradient Boosting": GradientBoostingClassifier(
-            n_estimators=400,
-            learning_rate=0.01,
-            max_depth=3,
-            random_state=42
+            n_estimators=400, learning_rate=0.01, max_depth=3, random_state=42
         ),
         "SVM (RBF, calibrated)": SVC(
-            kernel="rbf",
-            probability=True,
-            C=2.0,
-            gamma="scale",
-            class_weight="balanced",
-            random_state=42
+            kernel="rbf", probability=True, C=2.0,
+            gamma="scale", class_weight="balanced"
         ),
         "Neural Network (MLP)": MLPClassifier(
             hidden_layer_sizes=(32, 16),
             activation="relu",
-            solver="adam",
             learning_rate_init=0.001,
-            max_iter=2000,
-            random_state=42
+            max_iter=2000
         )
     }
 
-# ----------------------------------------------------------------------
-# 6. TRAIN ALL MODELS + METRICS
-# ----------------------------------------------------------------------
-@st.cache_resource
-def train_all_models(df_target, features):
-    # Time-based split
+
+def evaluate_model(model_name, model, X_train, y_train, X_val, y_val):
+    weights = np.where(y_train == 1, 10, 1)
+
+    if model_name == "Neural Network (MLP)":
+        model.fit(X_train, y_train)
+    else:
+        model.fit(X_train, y_train, sample_weight=weights)
+
+    if hasattr(model, "predict_proba"):
+        val_probs = model.predict_proba(X_val)[:, 1]
+    else:
+        raw = model.decision_function(X_val)
+        val_probs = (raw - raw.min()) / (raw.max() - raw.min())
+
+    best_f1, best_thresh = 0.0, 0.5
+    for t in np.arange(0.05, 0.90, 0.01):
+        preds = (val_probs >= t).astype(int)
+        f1 = f1_score(y_val, preds, zero_division=0)
+        if f1 > best_f1:
+            best_f1, best_thresh = f1, t
+
+    preds = (val_probs >= best_thresh).astype(int)
+
+    return {
+        "model": model_name,
+        "ROC-AUC": roc_auc_score(y_val, val_probs),
+        "PR-AUC": average_precision_score(y_val, val_probs),
+        "Precision": precision_score(y_val, preds, zero_division=0),
+        "Recall": recall_score(y_val, preds, zero_division=0),
+        "F1": best_f1,
+        "threshold": best_thresh,
+        "clf": model
+    }
+
+
+def get_probs(model, X):
+    if hasattr(model, "predict_proba"):
+        return model.predict_proba(X)[:, 1]
+    raw = model.decision_function(X)
+    return (raw - raw.min()) / (raw.max() - raw.min())
+
+
+# cache the full training so Streamlit doesn't retrain on every interaction
+@st.cache_data
+def run_full_pipeline(file="JSTdatasetR6.xlsx"):
+    df_raw = load_data(file)
+    df_feat, features = engineer_features(df_raw)
+    df_clean = clean_data(df_feat)
+    df_target = create_target(df_clean)
+
     train = df_target[df_target["year"] < 1970]
     val   = df_target[(df_target["year"] >= 1970) & (df_target["year"] < 1990)]
     test  = df_target[df_target["year"] >= 1990]
 
-    X_train = train[features]
+    X_train = train.drop(columns=["target", "crisisJST", "country", "year"])
+    X_val   = val.drop(columns=["target", "crisisJST", "country", "year"])
+    X_test  = test.drop(columns=["target", "crisisJST", "country", "year"])
+
     y_train = train["target"]
-    X_val   = val[features]
     y_val   = val["target"]
-    X_test  = test[features]
     y_test  = test["target"]
 
     scaler = StandardScaler()
@@ -211,171 +219,181 @@ def train_all_models(df_target, features):
     Xs_val   = scaler.transform(X_val)
     Xs_test  = scaler.transform(X_test)
 
-    models = build_model_set()
-    results = {}
-    comparison_rows = []
+    model_set = build_model_set()
+    results = []
+    models = {}
 
-    for name, clf in models.items():
-        st.write(f"🔧 Training: **{name}**")
+    for name, clf in model_set.items():
+        res = evaluate_model(name, clf, Xs_train, y_train, Xs_val, y_val)
+        results.append(res)
+        models[name] = res  # store full info
 
-        sample_weights = np.where(y_train == 1, 10, 1)
+    results_df = pd.DataFrame(results)
+    best_row = results_df.sort_values("F1", ascending=False).iloc[0]
+    best_name = best_row["model"]
+    best_thresh = best_row["threshold"]
 
-        if name == "Neural Network (MLP)":
-            clf.fit(Xs_train, y_train)
-        else:
-            clf.fit(Xs_train, y_train, sample_weight=sample_weights)
+    # compute test metrics for all models
+    test_rows = []
+    for name, info in models.items():
+        clf = info["clf"]
+        thresh = info["threshold"]
+        probs = get_probs(clf, Xs_test)
+        preds = (probs >= thresh).astype(int)
 
-        # Validation probabilities
-        if hasattr(clf, "predict_proba"):
-            val_probs = clf.predict_proba(Xs_val)[:, 1]
-        else:
-            raw = clf.decision_function(Xs_val)
-            val_probs = (raw - raw.min()) / (raw.max() - raw.min() + 1e-9)
-
-        # Threshold tuning on validation (F1)
-        best_f1, best_t = 0.0, 0.5
-        for t in np.arange(0.05, 0.90, 0.01):
-            preds = (val_probs >= t).astype(int)
-            f1 = f1_score(y_val, preds, zero_division=0)
-            if f1 > best_f1:
-                best_f1, best_t = f1, t
-
-        val_preds = (val_probs >= best_t).astype(int)
-        val_roc = roc_auc_score(y_val, val_probs)
-        val_pr  = average_precision_score(y_val, val_probs)
-        val_prec = precision_score(y_val, val_preds, zero_division=0)
-        val_rec  = recall_score(y_val, val_preds, zero_division=0)
-
-        # Test probabilities
-        if hasattr(clf, "predict_proba"):
-            test_probs = clf.predict_proba(Xs_test)[:, 1]
-        else:
-            raw_t = clf.decision_function(Xs_test)
-            test_probs = (raw_t - raw_t.min()) / (raw_t.max() - raw_t.min() + 1e-9)
-
-        test_preds = (test_probs >= best_t).astype(int)
-        test_roc = roc_auc_score(y_test, test_probs)
-        test_pr  = average_precision_score(y_test, test_probs)
-        test_prec = precision_score(y_test, test_preds, zero_division=0)
-        test_rec  = recall_score(y_test, test_preds, zero_division=0)
-        test_f1   = f1_score(y_test, test_preds, zero_division=0)
-
-        results[name] = {
-            "clf": clf,
-            "threshold": best_t,
-            "val_probs": val_probs,
-            "test_probs": test_probs,
-            "val_metrics": {
-                "ROC-AUC": val_roc,
-                "PR-AUC": val_pr,
-                "Precision": val_prec,
-                "Recall": val_rec,
-                "F1": best_f1,
-            },
-            "test_metrics": {
-                "ROC-AUC": test_roc,
-                "PR-AUC": test_pr,
-                "Precision": test_prec,
-                "Recall": test_rec,
-                "F1": test_f1,
-            },
-        }
-
-        comparison_rows.append({
+        test_rows.append({
             "model": name,
-            "VAL_ROC-AUC": val_roc,
-            "VAL_PR-AUC": val_pr,
-            "VAL_F1": best_f1,
-            "TEST_ROC-AUC": test_roc,
-            "TEST_PR-AUC": test_pr,
-            "TEST_F1": test_f1,
-            "threshold": best_t
+            "ROC-AUC": roc_auc_score(y_test, probs),
+            "PR-AUC": average_precision_score(y_test, probs),
+            "Precision": precision_score(y_test, preds, zero_division=0),
+            "Recall": recall_score(y_test, preds, zero_division=0),
+            "F1": f1_score(y_test, preds, zero_division=0),
+            "threshold": thresh
         })
 
-    comparison_df = pd.DataFrame(comparison_rows)
-    return results, comparison_df, scaler, train, val, test, features
+    test_df_metrics = pd.DataFrame(test_rows)
+
+    # add risk scores for best model
+    df_full = df_target.copy()
+    X_full = df_full.drop(columns=["target", "crisisJST", "country", "year"])
+    Xs_full = scaler.transform(X_full)
+    df_full["risk_score"] = get_probs(models[best_name]["clf"], Xs_full)
+
+    return {
+        "df_raw": df_raw,
+        "df_target": df_target,
+        "train_df": train,
+        "val_df": val,
+        "test_df": test,
+        "features": features,
+        "scaler": scaler,
+        "Xs_train": Xs_train,
+        "Xs_val": Xs_val,
+        "Xs_test": Xs_test,
+        "y_train": y_train,
+        "y_val": y_val,
+        "y_test": y_test,
+        "model_results_val": results_df,
+        "model_results_test": test_df_metrics,
+        "models": models,
+        "best_model_name": best_name,
+        "best_threshold": best_thresh,
+        "df_full": df_full,
+    }
+
 
 # ----------------------------------------------------------------------
-# RUN PIPELINE
+# 2. STREAMLIT APP LAYOUT
 # ----------------------------------------------------------------------
-df_raw = load_data()
-df_feat, feature_list = engineer_features(df_raw)
-df_clean = clean_data(df_feat)
-df_target = create_target(df_clean)
-
-results, comparison_df, scaler, train_df, val_df, test_df, features = train_all_models(
-    df_target, feature_list
+st.set_page_config(
+    page_title="Financial Crisis Early Warning Dashboard",
+    layout="wide"
 )
 
-# ----------------------------------------------------------------------
-# SIDEBAR CONTROLS
-# ----------------------------------------------------------------------
+st.title("📉 Financial Crisis Early Warning System")
+st.caption("Multi-model early warning system for USA, UK and Canada (1870–2020)")
+
+# Run pipeline
+pipeline = run_full_pipeline()
+df_raw      = pipeline["df_raw"]
+df_target   = pipeline["df_target"]
+train_df    = pipeline["train_df"]
+val_df      = pipeline["val_df"]
+test_df     = pipeline["test_df"]
+features    = pipeline["features"]
+scaler      = pipeline["scaler"]
+Xs_train    = pipeline["Xs_train"]
+Xs_val      = pipeline["Xs_val"]
+Xs_test     = pipeline["Xs_test"]
+y_train     = pipeline["y_train"]
+y_val       = pipeline["y_val"]
+y_test      = pipeline["y_test"]
+results_val = pipeline["model_results_val"]
+results_test= pipeline["model_results_test"]
+models      = pipeline["models"]
+best_name   = pipeline["best_model_name"]
+best_thresh = pipeline["best_threshold"]
+df_full     = pipeline["df_full"]
+
+# Sidebar controls
 st.sidebar.header("⚙️ Controls")
 
-# Theme (simple CSS tweak)
-theme = st.sidebar.radio("Theme", ["Light", "Dark"], index=0)
-if theme == "Dark":
-    st.markdown(
-        """
-        <style>
-        body { background-color: #111111; color: #EEEEEE; }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-# Model selection
-model_names = list(results.keys())
-selected_model_name = st.sidebar.selectbox("Select model", model_names, index=model_names.index("Gradient Boosting") if "Gradient Boosting" in model_names else 0)
-selected_model_info = results[selected_model_name]
-selected_clf = selected_model_info["clf"]
+model_options = list(models.keys())
+default_idx = model_options.index(best_name)
+selected_model_name = st.sidebar.selectbox(
+    "Select model to inspect", model_options, index=default_idx
+)
+selected_model_info = models[selected_model_name]
+selected_model = selected_model_info["clf"]
 selected_threshold = selected_model_info["threshold"]
 
-st.sidebar.markdown(f"**Selected Model:** {selected_model_name}")
-st.sidebar.markdown(f"**Optimal Threshold:** `{selected_threshold:.2f}`")
-
-# ----------------------------------------------------------------------
-# TABS LAYOUT
-# ----------------------------------------------------------------------
-tab1, tab2, tab3, tab4 = st.tabs(
-    ["📊 Model Results", "🔍 SHAP Explainability", "📈 Risk Timeline", "📂 Data Explorer"]
+selected_countries = st.sidebar.multiselect(
+    "Select countries for risk timeline",
+    options=["USA", "UK", "Canada"],
+    default=["USA", "UK", "Canada"]
 )
+
+st.sidebar.markdown(f"**Best model (by F1 on validation):** `{best_name}`")
+st.sidebar.markdown(f"**Best threshold (val):** `{best_thresh:.2f}`")
+
+# Tabs
+tab1, tab2, tab3, tab4 = st.tabs([
+    "📊 Model Results",
+    "🔍 SHAP Explainability",
+    "📈 Risk Timeline",
+    "📂 Data Explorer"
+])
+
 
 # ----------------------------------------------------------------------
 # TAB 1 – MODEL RESULTS
 # ----------------------------------------------------------------------
 with tab1:
-    st.header("📊 Model Comparison & Performance")
+    st.header("📊 Model Performance")
 
-    st.subheader("Validation vs Test Performance (All Models)")
-    st.dataframe(comparison_df.style.format({
-        "VAL_ROC-AUC": "{:.3f}",
-        "VAL_PR-AUC": "{:.3f}",
-        "VAL_F1": "{:.3f}",
-        "TEST_ROC-AUC": "{:.3f}",
-        "TEST_PR-AUC": "{:.3f}",
-        "TEST_F1": "{:.3f}",
+    st.subheader("Validation Set (1970–1990)")
+    st.dataframe(results_val.style.format({
+        "ROC-AUC": "{:.3f}",
+        "PR-AUC": "{:.3f}",
+        "Precision": "{:.3f}",
+        "Recall": "{:.3f}",
+        "F1": "{:.3f}",
         "threshold": "{:.2f}"
     }))
 
-    # Show detailed metrics for selected model
-    st.subheader(f"Detailed Test Metrics – {selected_model_name}")
-    test_metrics = selected_model_info["test_metrics"]
-    st.write(pd.DataFrame(test_metrics, index=["Test"]).T)
+    st.subheader("Test Set (1990–2020)")
+    st.dataframe(results_test.style.format({
+        "ROC-AUC": "{:.3f}",
+        "PR-AUC": "{:.3f}",
+        "Precision": "{:.3f}",
+        "Recall": "{:.3f}",
+        "F1": "{:.3f}",
+        "threshold": "{:.2f}"
+    }))
 
-    # Confusion matrix for selected model
+    st.markdown(f"### Selected Model: `{selected_model_name}` – Test Performance")
+
+    # compute test metrics for selected model
+    probs_sel = get_probs(selected_model, Xs_test)
+    preds_sel = (probs_sel >= selected_threshold).astype(int)
+
+    roc_sel = roc_auc_score(y_test, probs_sel)
+    pr_sel  = average_precision_score(y_test, probs_sel)
+    prec_sel= precision_score(y_test, preds_sel, zero_division=0)
+    rec_sel = recall_score(y_test, preds_sel, zero_division=0)
+    f1_sel  = f1_score(y_test, preds_sel, zero_division=0)
+
+    colA, colB, colC, colD, colE = st.columns(5)
+    colA.metric("ROC-AUC", f"{roc_sel:.3f}")
+    colB.metric("PR-AUC", f"{pr_sel:.3f}")
+    colC.metric("Precision", f"{prec_sel:.3f}")
+    colD.metric("Recall", f"{rec_sel:.3f}")
+    colE.metric("F1", f"{f1_sel:.3f}")
+
+    # Confusion matrix
     st.subheader("Confusion Matrix (Test Set)")
-    X_test = scaler.transform(test_df[features])
-    if hasattr(selected_clf, "predict_proba"):
-        test_probs_sel = selected_clf.predict_proba(X_test)[:, 1]
-    else:
-        raw_t = selected_clf.decision_function(X_test)
-        test_probs_sel = (raw_t - raw_t.min()) / (raw_t.max() - raw_t.min() + 1e-9)
-
-    test_preds_sel = (test_probs_sel >= selected_threshold).astype(int)
-    cm = confusion_matrix(test_df["target"], test_preds_sel)
-
-    fig_cm, ax_cm = plt.subplots(figsize=(4, 3))
+    cm = confusion_matrix(y_test, preds_sel)
+    fig_cm, ax_cm = plt.subplots(figsize=(4, 4))
     sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", ax=ax_cm,
                 xticklabels=["No Crisis", "Crisis"],
                 yticklabels=["No Crisis", "Crisis"])
@@ -383,36 +401,16 @@ with tab1:
     ax_cm.set_ylabel("Actual")
     st.pyplot(fig_cm)
 
-    # Precision–Recall curve for selected model
+    # Precision–Recall curve
     st.subheader("Precision–Recall Curve (Test Set)")
-    prec_curve, rec_curve, _ = precision_recall_curve(test_df["target"], test_probs_sel)
-    fig_pr, ax_pr = plt.subplots(figsize=(5, 3))
-    ax_pr.plot(rec_curve, prec_curve, label="Model")
-    baseline = test_df["target"].mean()
-    ax_pr.axhline(baseline, linestyle="--", color="red", label=f"Baseline ({baseline:.2%})")
+    prec_curve, rec_curve, _ = precision_recall_curve(y_test, probs_sel)
+    fig_pr, ax_pr = plt.subplots(figsize=(5, 4))
+    ax_pr.plot(rec_curve, prec_curve, lw=2)
     ax_pr.set_xlabel("Recall")
     ax_pr.set_ylabel("Precision")
     ax_pr.grid(alpha=0.3)
-    ax_pr.legend()
     st.pyplot(fig_pr)
 
-    # Crisis heatmap (by country & decade)
-    st.subheader("Crisis & Risk Heatmap (by Decade)")
-    test_risk_df = test_df.copy()
-    test_risk_df["predicted_prob"] = test_probs_sel
-    test_risk_df["decade"] = (test_risk_df["year"] // 10) * 10
-
-    heat = test_risk_df.groupby(["country", "decade"]).agg(
-        crisis_rate=("crisisJST", "mean"),
-        avg_risk=("predicted_prob", "mean")
-    ).reset_index()
-
-    heat_pivot = heat.pivot(index="country", columns="decade", values="avg_risk")
-
-    fig_hm, ax_hm = plt.subplots(figsize=(6, 3))
-    sns.heatmap(heat_pivot, annot=True, fmt=".2f", cmap="Reds", ax=ax_hm)
-    ax_hm.set_title("Average Predicted Crisis Risk by Country & Decade")
-    st.pyplot(fig_hm)
 
 # ----------------------------------------------------------------------
 # TAB 2 – SHAP EXPLAINABILITY
@@ -420,29 +418,39 @@ with tab1:
 with tab2:
     st.header("🔍 SHAP Global Explainability")
 
-    if selected_model_name != "Logistic Regression (Rare Event)":
-        st.info("SHAP is enabled only for **Logistic Regression** in this app for efficiency and stability. Select that model in the sidebar to view SHAP explanations.")
+    if selected_model_name not in ["Logistic Regression (Rare Event)", "Gradient Boosting", "Random Forest"]:
+        st.info("SHAP is only enabled for Logistic Regression and tree-based models (Gradient Boosting, Random Forest). Please select one of those in the sidebar.")
     else:
-        st.markdown("Global feature importance for **Logistic Regression (Rare Event)**.")
-        X_train = scaler.transform(train_df[features])
-        X_test = scaler.transform(test_df[features])
+        st.write(f"Global feature contribution for **{selected_model_name}**.")
+
+        X_train_feats = train_df[features]
+        X_test_feats  = test_df[features]
+
+        # use scaled versions if needed
+        Xs_train_feats = Xs_train
+        Xs_test_feats  = Xs_test
 
         try:
-            shap.initjs()
-            explainer = shap.LinearExplainer(results["Logistic Regression (Rare Event)"]["clf"], X_train)
-            shap_vals = explainer.shap_values(X_test)
+            if selected_model_name in ["Gradient Boosting", "Random Forest"]:
+                explainer = shap.TreeExplainer(selected_model)
+                shap_vals = explainer.shap_values(Xs_test_feats)
+            else:
+                explainer = shap.LinearExplainer(selected_model, Xs_train_feats)
+                shap_vals = explainer.shap_values(Xs_test_feats)
 
-            st.subheader("SHAP Summary Plot (Test Set)")
-            shap.summary_plot(shap_vals, test_df[features], show=False)
-            fig = plt.gcf()
-            st.pyplot(fig, clear_figure=True)
+            st.subheader("SHAP Summary Plot")
+            fig1, ax1 = plt.subplots(figsize=(8, 4))
+            shap.summary_plot(shap_vals, X_test_feats, show=False)
+            st.pyplot(fig1)
 
             st.subheader("SHAP Global Feature Importance (Bar)")
-            shap.summary_plot(shap_vals, test_df[features], plot_type="bar", show=False)
-            fig2 = plt.gcf()
-            st.pyplot(fig2, clear_figure=True)
+            fig2, ax2 = plt.subplots(figsize=(8, 4))
+            shap.summary_plot(shap_vals, X_test_feats, plot_type="bar", show=False)
+            st.pyplot(fig2)
+
         except Exception as e:
-            st.error(f"SHAP failed to compute: {e}")
+            st.error(f"SHAP computation failed: {e}")
+
 
 # ----------------------------------------------------------------------
 # TAB 3 – RISK TIMELINE
@@ -450,78 +458,77 @@ with tab2:
 with tab3:
     st.header("📈 Crisis Risk Timeline")
 
-    # Risk for selected model
-    test_probs_all = selected_model_info["test_probs"]
-    test_df_model = test_df.copy()
-    test_df_model["predicted_prob"] = test_probs_all
-    test_df_model["predicted_class"] = (test_probs_all >= selected_threshold).astype(int)
+    st.markdown(f"Using **best model** (by validation F1): `{best_name}` with threshold `{best_thresh:.2f}`")
 
-    # Country selector
-    country = st.selectbox("Select country", ["USA", "UK", "Canada"])
-    df_c = test_df_model[test_df_model["country"] == country].copy()
+    for c in selected_countries:
+        df_c = df_full[df_full["country"] == c].copy()
+        if df_c.empty:
+            continue
 
-    # Single country timeline + regimes
-    st.subheader(f"{country} — Crisis Risk Timeline (Test Period)")
-    fig_rt, ax_rt = plt.subplots(figsize=(10, 4))
-    ax_rt.plot(df_c["year"], df_c["predicted_prob"], color="purple", label="Risk Score")
-    ax_rt.axhline(selected_threshold, color="orange", linestyle="--", label=f"Threshold ({selected_threshold:.2f})")
+        fig, ax = plt.subplots(figsize=(10, 3))
+        ax.plot(df_c["year"], df_c["risk_score"], color="purple", lw=2, label="Risk Score")
+        ax.axhline(best_thresh, color="orange", linestyle="--", label="Threshold")
 
-    # Crisis shading
-    for y in df_c[df_c["crisisJST"] == 1]["year"]:
-        ax_rt.axvspan(y - 0.5, y + 0.5, color="red", alpha=0.3)
+        crisis_years = df_c[df_c["crisisJST"] == 1]["year"]
+        for y in crisis_years:
+            ax.axvspan(y - 0.5, y + 0.5, color="red", alpha=0.3)
 
-    # Simple regime segmentation (vertical lines)
-    for year, label in [(1990, "Post-Cold War"), (2000, "Dot-com"), (2007, "Pre-GFC"), (2008, "GFC"), (2010, "Post-GFC")]:
-        ax_rt.axvline(year, color="grey", alpha=0.3, linestyle=":")
-        ax_rt.text(year + 0.1, 0.95, label, rotation=90, fontsize=7, alpha=0.6)
+        ax.axvline(1990, lw=2, color="black")
+        ax.text(df_c["year"].min(), 0.95, "TRAINING", color="gray", fontsize=8)
+        ax.text(1992, 0.95, "TEST", color="black", fontsize=8)
 
-    ax_rt.set_ylim(0, 1)
-    ax_rt.set_xlabel("Year")
-    ax_rt.set_ylabel("Crisis Probability")
-    ax_rt.legend(loc="upper left")
-    ax_rt.grid(alpha=0.3)
-    st.pyplot(fig_rt)
+        ax.set_title(f"{c} – Crisis Risk Timeline")
+        ax.set_ylabel("Predicted Probability")
+        ax.set_xlabel("Year")
+        ax.set_ylim(0, 1)
+        ax.grid(alpha=0.3)
+        ax.legend(loc="upper left")
+        st.pyplot(fig)
 
-    # Country comparison
-    st.subheader("🇺🇸🇬🇧🇨🇦 Risk Comparison Across Countries")
-    fig_cmp, ax_cmp = plt.subplots(figsize=(10, 4))
-    for c in ["USA", "UK", "Canada"]:
-        tmp = test_df_model[test_df_model["country"] == c]
-        ax_cmp.plot(tmp["year"], tmp["predicted_prob"], label=c)
-
-    ax_cmp.axhline(selected_threshold, color="orange", linestyle="--", label="Threshold")
-    ax_cmp.set_xlabel("Year")
-    ax_cmp.set_ylabel("Crisis Probability")
-    ax_cmp.set_ylim(0, 1)
-    ax_cmp.legend()
-    ax_cmp.grid(alpha=0.3)
-    st.pyplot(fig_cmp)
 
 # ----------------------------------------------------------------------
 # TAB 4 – DATA EXPLORER
 # ----------------------------------------------------------------------
 with tab4:
-    st.header("📂 Data Explorer")
+    st.header("📂 Test Data Explorer (1990–2020)")
+    st.markdown("Explore test-period predictions, actual crises, and features.")
 
-    test_export = test_df.copy()
-    test_export["predicted_prob"] = results[selected_model_name]["test_probs"]
-    test_export["predicted_class"] = (test_export["predicted_prob"] >= selected_threshold).astype(int)
+    probs_best = get_probs(models[best_name]["clf"], Xs_test)
+    preds_best = (probs_best >= best_thresh).astype(int)
 
-    country_filter = st.selectbox("Filter by Country", ["All", "USA", "UK", "Canada"])
-    if country_filter != "All":
-        test_view = test_export[test_export["country"] == country_filter]
-    else:
-        test_view = test_export
+    explorer_df = test_df.copy()
+    explorer_df["predicted_prob"] = probs_best
+    explorer_df["predicted_class"] = preds_best
+    explorer_df["prediction_type"] = "TN"
+    explorer_df.loc[(explorer_df["predicted_class"] == 1) & (explorer_df["target"] == 1), "prediction_type"] = "TP"
+    explorer_df.loc[(explorer_df["predicted_class"] == 1) & (explorer_df["target"] == 0), "prediction_type"] = "FP"
+    explorer_df.loc[(explorer_df["predicted_class"] == 0) & (explorer_df["target"] == 1), "prediction_type"] = "FN"
 
-    st.dataframe(test_view)
+    country_filter = st.multiselect(
+        "Filter by country",
+        options=["USA", "UK", "Canada"],
+        default=["USA", "UK", "Canada"]
+    )
 
-    csv_data = test_view.to_csv(index=False)
+    type_filter = st.multiselect(
+        "Filter by prediction type",
+        options=["TP", "FP", "TN", "FN"],
+        default=["TP", "FP", "TN", "FN"]
+    )
+
+    df_filtered = explorer_df[
+        explorer_df["country"].isin(country_filter)
+        & explorer_df["prediction_type"].isin(type_filter)
+    ]
+
+    st.dataframe(df_filtered.sort_values(["country", "year"]).reset_index(drop=True))
+
+    csv = df_filtered.to_csv(index=False).encode("utf-8")
     st.download_button(
-        label="Download filtered data as CSV",
-        data=csv_data,
-        file_name=f"crisis_predictions_{selected_model_name.replace(' ', '_')}.csv",
+        "Download filtered data as CSV",
+        data=csv,
+        file_name="test_predictions_filtered.csv",
         mime="text/csv"
     )
 
-    st.markdown("Tip: Use this export in Power BI for additional custom visuals.")
 
