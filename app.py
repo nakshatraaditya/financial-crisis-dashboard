@@ -1,286 +1,238 @@
-# ======================================================================
-#  FINANCIAL CRISIS EARLY WARNING SYSTEM – STREAMLIT DASHBOARD (TABS + SHAP)
-# ======================================================================
-
 import streamlit as st
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
 import shap
+import matplotlib.pyplot as plt
 
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import (
-    roc_auc_score, precision_score, recall_score,
-    confusion_matrix, precision_recall_curve,
-    average_precision_score, f1_score
-)
 from sklearn.preprocessing import StandardScaler
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import precision_recall_curve, roc_auc_score, precision_score, recall_score, confusion_matrix
 
-st.set_page_config(page_title="Financial Crisis Early Warning System",
-                   layout="wide")
+st.set_page_config(page_title="Financial Crisis Dashboard", layout="wide")
+st.title("📉 Financial Crisis Early Warning System — USA, UK, Canada")
 
-st.title("📉 Financial Crisis Early Warning Dashboard")
-st.markdown("An interactive early-warning system for USA, UK, and Canada using machine learning.")
 
-# ======================================================================
+# =============================================================================
 # 1. LOAD DATA
-# ======================================================================
+# =============================================================================
 @st.cache_data
-def load_data(file="JSTdatasetR6.xlsx"):
-    df = pd.read_excel(file)
+def load_data(path="JSTdatasetR6.xlsx - Sheet1.csv"):
+    try:
+        df = pd.read_csv(path)
+    except:
+        df = pd.read_excel("JSTdatasetR6.xlsx")
+
     df = df[df["country"].isin(["USA", "UK", "Canada"])].copy()
-    df = df.sort_values(["country", "year"])
+    df = df.sort_values(["country", "year"]).reset_index(drop=True)
     return df
 
-# ======================================================================
-# 2. FEATURE ENGINEERING
-# ======================================================================
-def engineer_features(df):
+
+# =============================================================================
+# 2. FEATURE ENGINEERING (Leakage-Free)
+# =============================================================================
+def add_base_features(df):
+
     df = df.copy()
-    df["leverage_risk"] = 1 / (df["lev"] + 0.01)
 
-    def expanding_z(df_inner, col):
-        def _z(series):
-            m = series.expanding().mean()
-            sd = series.expanding().std().replace(0, np.nan)
-            return (series - m) / (sd + 1e-9)
-        return df_inner.groupby("country")[col].transform(_z)
+    def z(x): 
+        return (x - x.mean()) / (x.std() + 1e-8)
 
-    df["noncore_z"] = expanding_z(df, "noncore")
-    df["ltd_z"] = expanding_z(df, "ltd")
-    df["leverage_z"] = expanding_z(df, "leverage_risk")
-    df["banking_fragility"] = (
-        0.4 * df["noncore_z"] +
-        0.3 * df["ltd_z"] +
-        0.3 * df["leverage_z"]
-    )
+    if "lev" in df.columns:
+        df["leverage_risk"] = 1 / (df["lev"] + 0.01)
 
-    df["hp_real"] = df["hpnom"] / df["cpi"]
+    if all(c in df.columns for c in ["noncore", "ltd", "lev"]):
+        df["banking_fragility_index"] = (
+            0.4 * z(df["noncore"].fillna(0)) +
+            0.3 * z(df["ltd"].fillna(0)) +
+            0.3 * z(df["leverage_risk"].fillna(0))
+        )
+
+    if "hpnom" in df.columns and "cpi" in df.columns:
+        df["hp_real"] = df["hpnom"] / df["cpi"]
+
+    if "tloans" in df.columns and "cpi" in df.columns:
+        df["real_credit"] = df["tloans"] / df["cpi"]
+
+    if "money" in df.columns and "gdp" in df.columns:
+        df["money_gdp_ratio"] = df["money"] / df["gdp"]
+
+    if "ca" in df.columns and "gdp" in df.columns:
+        df["ca_gdp_ratio"] = df["ca"] / df["gdp"]
+
+    if "ltrate" in df.columns:
+        us_curve = df[df["country"] == "USA"][["year", "ltrate"]].drop_duplicates("year")
+        us_curve = us_curve.set_index("year")["ltrate"].to_dict()
+        df["us_ltrate"] = df["year"].map(us_curve)
+        df["sovereign_spread"] = df["ltrate"] - df["us_ltrate"]
+
+    if "stir" in df.columns and "ltrate" in df.columns:
+        df["yield_curve_slope"] = df["ltrate"] - df["stir"]
+
+    return df
+
+
+def add_rolling_features(df):
+
+    df = df.copy()
+    df["credit_growth"] = df.groupby("country")["real_credit"].pct_change()
+
     df["hp_trend"] = df.groupby("country")["hp_real"].transform(
         lambda x: x.rolling(10, min_periods=5).mean()
     )
-    df["housing_bubble"] = (df["hp_real"] - df["hp_trend"]) / (df["hp_trend"] + 1e-9)
+    df["housing_bubble"] = (df["hp_real"] - df["hp_trend"]) / df["hp_trend"]
 
-    df["real_credit"] = df["tloans"] / df["cpi"]
-    df["credit_growth"] = df.groupby("country")["real_credit"].pct_change()
+    df["money_expansion"] = df.groupby("country")["money_gdp_ratio"].pct_change()
 
-    df["yield_curve"] = df["ltrate"] - df["stir"]
-
-    us_ltrate_map = (
-        df[df["country"] == "USA"]
-        .drop_duplicates("year")
-        .set_index("year")["ltrate"].to_dict()
-    )
-    df["us_ltrate"] = df["year"].map(us_ltrate_map)
-    df["sovereign_spread"] = df["ltrate"] - df["us_ltrate"]
-
-    df["money_gdp"] = df["money"] / df["gdp"]
-    df["money_expansion"] = df.groupby("country")["money_gdp"].pct_change()
-
-    df["ca_gdp"] = df["ca"] / df["gdp"]
-
-    features = [
-        "housing_bubble", "credit_growth", "banking_fragility",
-        "sovereign_spread", "yield_curve",
-        "money_expansion", "ca_gdp",
-    ]
-
-    df = df[["country", "year", "crisisJST"] + features]
-    df = df.replace([np.inf, -np.inf], np.nan)
-    return df, features
-
-# ======================================================================
-# 3. CLEAN DATA (Causal Imputation)
-# ======================================================================
-def clean_data(df):
-    df = df.copy()
-    df = df[~df["year"].between(1914, 1918)]
-    df = df[~df["year"].between(1939, 1945)]
-    features = [c for c in df.columns if c not in ["country", "year", "crisisJST"]]
-
-    for col in features:
-        df[f"{col}_missing"] = df[col].isna().astype(int)
-
-    df[features] = df.groupby("country")[features].transform(
-        lambda s: s.ffill(limit=3).bfill(limit=3)
-    )
-    df[features] = df.groupby("country")[features].transform(
-        lambda s: s.fillna(s.median())
-    )
     return df
 
-# ======================================================================
-# 4. TARGET VARIABLE
-# ======================================================================
-def create_target(df):
+
+def make_target(df, horizon=2):
     df = df.copy()
-    df["target"] = (
-        df.groupby("country")["crisisJST"]
-        .shift(-1)
-        .rolling(2, min_periods=1)
-        .max()
+    df["target"] = df.groupby("country")["crisisJST"].shift(-horizon)
+    return df.dropna(subset=["target"])
+
+
+# =============================================================================
+# 3. MODELING UTILITIES
+# =============================================================================
+def prepare_xy(train, test, feature_cols):
+
+    imp = SimpleImputer(strategy="median")
+    scl = StandardScaler()
+
+    X_train = imp.fit_transform(train[feature_cols])
+    X_train = scl.fit_transform(X_train)
+    y_train = train["target"].astype(int)
+
+    X_test = imp.transform(test[feature_cols])
+    X_test = scl.transform(X_test)
+    y_test = test["target"].astype(int)
+
+    return X_train, y_train, X_test, y_test, imp, scl
+
+
+def train_model(X, y):
+
+    model = LogisticRegression(
+        penalty="l1",
+        solver="liblinear",
+        class_weight="balanced",
+        max_iter=5000
     )
-    df = df.dropna(subset=["target"])
-    df["target"] = df["target"].astype(int)
-    return df
+    model.fit(X, y)
 
-# ======================================================================
-# 5. MODEL TRAINING
-# ======================================================================
-def train_model(train_df, features):
-    X = train_df[features]
-    y = train_df["target"]
+    probs = model.predict_proba(X)[:, 1]
 
-    scaler = StandardScaler()
-    Xs = scaler.fit_transform(X)
+    P, R, T = precision_recall_curve(y, probs)
+    f2 = (5 * P * R) / (4 * P + R + 1e-9)
 
-    weights = np.where(y == 1, 12, 1)
+    best_t = T[np.argmax(f2)]
 
-    clf = LogisticRegression(max_iter=5000, penalty="l2")
-    clf.fit(Xs, y, sample_weight=weights)
+    return model, best_t
 
-    return clf, scaler
 
-# ======================================================================
-# PROCESS DATA
-# ======================================================================
-df_raw = load_data()
-df_feat, features = engineer_features(df_raw)
-df_clean = clean_data(df_feat)
-df_target = create_target(df_clean)
+def predict(model, X, threshold):
+    probs = model.predict_proba(X)[:, 1]
+    preds = (probs >= threshold).astype(int)
+    return preds, probs
 
-train = df_target[df_target["year"] < 1970]
-val   = df_target[(df_target["year"] >= 1970) & (df_target["year"] < 1990)]
-test  = df_target[df_target["year"] >= 1990]
 
-model, scaler = train_model(train, features)
+# =============================================================================
+# 4. SHAP PLOT WRAPPER FOR STREAMLIT (NO initjs)
+# =============================================================================
+def st_shap(plot, height=400):
+    """Render SHAP force plots in Streamlit."""
+    import streamlit.components.v1 as components
+    html = f"<head>{shap.getjs()}</head><body>{plot.html()}</body>"
+    components.html(html, height=height)
 
-# Threshold tuning
-Xs_val = scaler.transform(val[features])
-val_probs = model.predict_proba(Xs_val)[:, 1]
 
-best_f1 = 0
-best_t = 0.5
-for t in np.arange(0.1, 0.9, 0.01):
-    preds = (val_probs >= t).astype(int)
-    f1 = f1_score(val["target"], preds)
-    if f1 > best_f1:
-        best_f1 = f1
-        best_t = t
+# =============================================================================
+# 5. PIPELINE + UI
+# =============================================================================
+df = load_data()
 
-threshold = best_t
+train_raw = df[df["year"] < 1990].copy()
+test_raw  = df[df["year"] >= 1990].copy()
 
-# ======================================================================
-# CREATE TABS
-# ======================================================================
-tab1, tab2, tab3, tab4 = st.tabs([
-    "📊 Model Results",
-    "🔍 SHAP Explainability",
-    "📈 Risk Timeline",
-    "📂 Data Explorer"
-])
+train_base = add_base_features(train_raw)
+test_base  = add_base_features(test_raw)
 
-# ======================================================================
-# TAB 1 — MODEL RESULTS
-# ======================================================================
-with tab1:
-    st.header("📊 Model Performance on Test Set (1990–2020)")
+train_feat = add_rolling_features(train_base)
+test_feat  = add_rolling_features(test_base)
 
-    test_X = scaler.transform(test[features])
-    test_probs = model.predict_proba(test_X)[:, 1]
-    test_preds = (test_probs >= threshold).astype(int)
+train = make_target(train_feat)
+test  = make_target(test_feat)
 
-    roc = roc_auc_score(test["target"], test_probs)
-    pr = average_precision_score(test["target"], test_probs)
-    precision = precision_score(test["target"], test_preds)
-    recall = recall_score(test["target"], test_preds)
-    f1 = f1_score(test["target"], test_preds)
+drop_cols = ["country", "year", "crisisJST", "target", "hp_trend"]
+feature_cols = [
+    c for c in train.columns
+    if c not in drop_cols and pd.api.types.is_numeric_dtype(train[c])
+]
 
-    st.write(pd.DataFrame({
-        "ROC-AUC": [roc],
-        "PR-AUC": [pr],
-        "Precision": [precision],
-        "Recall": [recall],
-        "Threshold": [threshold]
-    }))
+X_train, y_train, X_test, y_test, imp, scl = prepare_xy(train, test, feature_cols)
 
-    # PR Curve
-    st.subheader("Precision–Recall Curve")
-    prec_curve, rec_curve, _ = precision_recall_curve(test["target"], test_probs)
-    fig, ax = plt.subplots(figsize=(6, 4))
-    ax.plot(rec_curve, prec_curve)
-    ax.set_xlabel("Recall")
-    ax.set_ylabel("Precision")
-    ax.grid(alpha=0.3)
+model, threshold = train_model(X_train, y_train)
+preds, probs = predict(model, X_test, threshold)
+
+
+# =============================================================================
+# DISPLAY METRICS
+# =============================================================================
+st.subheader("📊 Model Performance (Test Set)")
+
+col1, col2, col3 = st.columns(3)
+col1.metric("ROC-AUC", f"{roc_auc_score(y_test, probs):.3f}")
+col2.metric("Precision", f"{precision_score(y_test, preds):.3f}")
+col3.metric("Recall", f"{recall_score(y_test, preds):.3f}")
+
+st.write("Confusion Matrix:")
+st.write(confusion_matrix(y_test, preds))
+
+
+# =============================================================================
+# COUNTRY RISK PLOTS
+# =============================================================================
+st.subheader("📉 Country Crisis Risk Over Time")
+
+for country in ["USA", "UK", "Canada"]:
+
+    cdf = test[test["country"] == country].copy()
+    cdf["risk"] = probs[test["country"] == country]
+
+    fig, ax = plt.subplots(figsize=(12, 4))
+    ax.plot(cdf["year"], cdf["risk"], label="Predicted Risk", linewidth=2)
+
+    for yr in cdf[cdf["target"] == 1]["year"]:
+        ax.axvspan(yr, yr+1, color="red", alpha=0.2)
+
+    ax.set_title(f"{country} Crisis Risk")
+    ax.set_ylabel("Predicted Probability")
+    ax.grid(True, alpha=0.3)
+
     st.pyplot(fig)
 
-# ======================================================================
-# TAB 2 — SHAP Explainability
-# ======================================================================
-with tab2:
-    st.header("🔍 SHAP Feature Importance")
 
-    shap.initjs()
-    X_train_scaled = scaler.transform(train[features])
-    X_test_scaled = scaler.transform(test[features])
+# =============================================================================
+# SHAP EXPLAINABILITY
+# =============================================================================
+st.subheader("🧠 SHAP Explainability")
 
-    explainer = shap.LinearExplainer(model, X_train_scaled)
-    shap_values = explainer.shap_values(X_test_scaled)
+explainer = shap.LinearExplainer(model, X_train)
+shap_values = explainer.shap_values(X_test)
 
-    st.subheader("Global Feature Impact (Summary Plot)")
-    shap_fig = shap.summary_plot(shap_values, test[features], show=False)
-    st.pyplot(bbox_inches="tight")
+st.write("### SHAP Summary Plot")
+fig, ax = plt.subplots(figsize=(10, 6))
+shap.summary_plot(shap_values, X_test, feature_names=feature_cols, show=False)
+st.pyplot(fig)
 
-# ======================================================================
-# TAB 3 — RISK TIMELINE
-# ======================================================================
-with tab3:
-    st.header("📈 Crisis Risk Timeline")
+st.write("### Individual Prediction Explanation")
 
-    country = st.selectbox("Select country", ["USA", "UK", "Canada"])
-    df_c = test[test["country"] == country].copy()
-    df_c["risk"] = test_probs[test["country"] == country]
-
-    fig, ax = plt.subplots(figsize=(10, 4))
-    ax.plot(df_c["year"], df_c["risk"], color="purple")
-    ax.axhline(threshold, color="orange", linestyle="--")
-
-    for y in df_c[df_c["crisisJST"] == 1]["year"]:
-        ax.axvspan(y - 0.5, y + 0.5, color="red", alpha=0.3)
-
-    ax.set_title(f"{country} — Crisis Risk Timeline")
-    st.pyplot(fig)
-
-    st.subheader("🇺🇸🇬🇧🇨🇦 Country Comparison")
-    fig2, ax2 = plt.subplots(figsize=(10, 4))
-    for c in ["USA", "UK", "Canada"]:
-        df_temp = test[test["country"] == c]
-        ax2.plot(df_temp["year"], test_probs[df_temp.index], label=c)
-
-    ax2.legend()
-    ax2.set_title("Risk Comparison Across Countries")
-    st.pyplot(fig2)
-
-# ======================================================================
-# TAB 4 — DATA EXPLORER
-# ======================================================================
-with tab4:
-    st.header("📂 Data Explorer")
-
-    selected_country = st.selectbox("Filter by Country", ["USA", "UK", "Canada", "All"])
-
-    df_exp = test.copy()
-    df_exp["predicted_prob"] = test_probs
-    df_exp["predicted_class"] = test_preds
-
-    if selected_country != "All":
-        df_exp = df_exp[df_exp["country"] == selected_country]
-
-    st.dataframe(df_exp)
-
-    st.download_button(
-        "Download Data as CSV",
-        df_exp.to_csv(index=False),
-        "crisis_predictions.csv",
-        "text/csv"
-    )
+i = st.slider("Select Test Observation", 0, len(X_test)-1, 0)
+force_plot = shap.ForcePlot(
+    explainer.expected_value,
+    shap_values[i],
+    feature_names=feature_cols
+)
+st_shap(force_plot, height=300)
