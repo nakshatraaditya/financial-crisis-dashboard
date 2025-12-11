@@ -419,33 +419,44 @@ with tab2:
     st.header("🔍 SHAP Global Explainability")
 
     if selected_model_name not in ["Logistic Regression (Rare Event)", "Gradient Boosting", "Random Forest"]:
-        st.info("SHAP is only enabled for Logistic Regression and tree-based models (Gradient Boosting, Random Forest). Please select one of those in the sidebar.")
+        st.info(
+            "SHAP is currently enabled only for:\n"
+            "- Logistic Regression (Rare Event)\n"
+            "- Gradient Boosting\n"
+            "- Random Forest\n\n"
+            "Please select one of these models in the sidebar."
+        )
     else:
-        st.write(f"Global feature contribution for **{selected_model_name}**.")
+        st.write(f"Global feature contribution for **{selected_model_name}**")
 
-        X_train_feats = train_df[features]
-        X_test_feats  = test_df[features]
-
-        # use scaled versions if needed
-        Xs_train_feats = Xs_train
-        Xs_test_feats  = Xs_test
+        # 🔹 Use EXACT feature matrix the model sees (scaled, all columns)
+        feature_names = X_train.columns  # includes engineered + *_missing
+        X_train_shap = pd.DataFrame(Xs_train, columns=feature_names)
+        X_test_shap  = pd.DataFrame(Xs_test,  columns=feature_names)
 
         try:
+            # Choose appropriate SHAP explainer
             if selected_model_name in ["Gradient Boosting", "Random Forest"]:
                 explainer = shap.TreeExplainer(selected_model)
-                shap_vals = explainer.shap_values(Xs_test_feats)
+                shap_vals = explainer.shap_values(X_test_shap)
+                # For tree models, shap_values may be list (for multiclass); here it's binary so we ensure array
+                if isinstance(shap_vals, list):
+                    shap_vals = shap_vals[1]  # class 1 (crisis)
             else:
-                explainer = shap.LinearExplainer(selected_model, Xs_train_feats)
-                shap_vals = explainer.shap_values(Xs_test_feats)
+                # Logistic regression – linear explainer
+                explainer = shap.LinearExplainer(selected_model, X_train_shap)
+                shap_vals = explainer.shap_values(X_test_shap)
 
-            st.subheader("SHAP Summary Plot")
+            # 🔹 SHAP summary plot (dot plot)
+            st.subheader("SHAP Summary Plot (Test Set)")
             fig1, ax1 = plt.subplots(figsize=(8, 4))
-            shap.summary_plot(shap_vals, X_test_feats, show=False)
+            shap.summary_plot(shap_vals, X_test_shap, show=False)
             st.pyplot(fig1)
 
+            # 🔹 SHAP global importance (bar)
             st.subheader("SHAP Global Feature Importance (Bar)")
             fig2, ax2 = plt.subplots(figsize=(8, 4))
-            shap.summary_plot(shap_vals, X_test_feats, plot_type="bar", show=False)
+            shap.summary_plot(shap_vals, X_test_shap, plot_type="bar", show=False)
             st.pyplot(fig2)
 
         except Exception as e:
