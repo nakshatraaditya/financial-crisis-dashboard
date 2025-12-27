@@ -7,17 +7,11 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-import seaborn as sns
 
-from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
-from sklearn.svm import SVC
-from sklearn.neural_network import MLPClassifier
-
+from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.metrics import (
-    roc_auc_score, precision_score, recall_score,
-    confusion_matrix, precision_recall_curve,
-    average_precision_score, f1_score
+    roc_auc_score, recall_score, f1_score,
+    average_precision_score
 )
 from sklearn.preprocessing import StandardScaler
 
@@ -36,6 +30,30 @@ st.title("📉 Financial Crisis Early Warning System")
 st.caption("USA · UK · Canada | 1870–2020 | Dissertation Dashboard")
 
 # ======================================================================
+# SIDEBAR CONTROLS
+# ======================================================================
+st.sidebar.header("Dashboard Controls")
+
+selected_countries = st.sidebar.multiselect(
+    "Select Countries",
+    ["USA", "UK", "Canada"],
+    default=["USA", "UK", "Canada"]
+)
+
+risk_threshold = st.sidebar.slider(
+    "Risk Threshold",
+    min_value=0.05,
+    max_value=0.9,
+    value=0.20,
+    step=0.01
+)
+
+show_crises = st.sidebar.checkbox(
+    "Show Crisis Periods",
+    value=True
+)
+
+# ======================================================================
 # DATA PIPELINE
 # ======================================================================
 
@@ -50,6 +68,7 @@ def load_data(file="JSTdatasetR6.xlsx"):
 def engineer_features(df):
     df = df.copy()
 
+    # --- Banking fragility ---
     df["leverage_risk"] = 1 / (df["lev"] + 0.01)
 
     def expanding_z(df_inner, col):
@@ -69,17 +88,21 @@ def engineer_features(df):
         0.3 * df["leverage_z"]
     )
 
+    # --- Housing bubble ---
     df["hp_real"] = df["hpnom"] / df["cpi"]
     df["hp_trend"] = df.groupby("country")["hp_real"].transform(
         lambda x: x.rolling(10, min_periods=5).mean()
     )
     df["housing_bubble"] = (df["hp_real"] - df["hp_trend"]) / (df["hp_trend"] + 1e-9)
 
+    # --- Credit ---
     df["real_credit"] = df["tloans"] / df["cpi"]
     df["credit_growth"] = df.groupby("country")["real_credit"].pct_change()
 
+    # --- Yield curve ---
     df["yield_curve"] = df["ltrate"] - df["stir"]
 
+    # --- Sovereign spread (vs USA) ---
     us_ltrate = (
         df[df["country"] == "USA"]
         .drop_duplicates("year")
@@ -89,9 +112,9 @@ def engineer_features(df):
     df["us_ltrate"] = df["year"].map(us_ltrate)
     df["sovereign_spread"] = df["ltrate"] - df["us_ltrate"]
 
+    # --- Monetary & external ---
     df["money_gdp"] = df["money"] / df["gdp"]
     df["money_expansion"] = df.groupby("country")["money_gdp"].pct_change()
-
     df["ca_gdp"] = df["ca"] / df["gdp"]
 
     features = [
@@ -109,6 +132,7 @@ def engineer_features(df):
 def clean_data(df):
     df = df.copy()
 
+    # Remove world war distortion
     df = df[~df["year"].between(1914, 1918)]
     df = df[~df["year"].between(1939, 1945)]
 
@@ -126,19 +150,22 @@ def clean_data(df):
 
 def create_target(df):
     df = df.copy()
+
+    # Crisis in t+1 to t+2 window
     df["target"] = (
         df.groupby("country")["crisisJST"]
         .shift(-1)
         .rolling(2, min_periods=1)
         .max()
     )
+
     df = df.dropna(subset=["target"])
     df["target"] = df["target"].astype(int)
+
     return df
 
-
 # ======================================================================
-# MODEL TRAINING (ONCE)
+# MODEL TRAINING (CACHED)
 # ======================================================================
 
 @st.cache_data
@@ -153,6 +180,7 @@ def train_model():
 
     X_train = train.drop(columns=["target", "crisisJST", "country", "year"])
     y_train = train["target"]
+
     X_test  = test.drop(columns=["target", "crisisJST", "country", "year"])
     y_test  = test["target"]
 
@@ -166,21 +194,13 @@ def train_model():
         max_depth=3,
         random_state=42
     )
+
     model.fit(Xs_train, y_train)
 
-    probs = model.predict_proba(Xs_test)[:, 1]
-
-    best_f1, best_t = 0, 0.5
-    for t in np.arange(0.05, 0.9, 0.01):
-        preds = (probs >= t).astype(int)
-        f1 = f1_score(y_test, preds)
-        if f1 > best_f1:
-            best_f1, best_t = f1, t
-
-    return model, scaler, best_t, df, X_test.columns
+    return model, scaler, df, X_test.columns, y_test, Xs_test
 
 
-model, scaler, threshold, df_full, feature_cols = train_model()
+model, scaler, df_full, feature_cols, y_test, Xs_test = train_model()
 
 # ======================================================================
 # TABS
@@ -196,47 +216,63 @@ tab1, tab2, tab3, tab4 = st.tabs([
 # TAB 1 – MODEL RESULTS
 # ======================================================================
 with tab1:
-    st.subheader("Final Model Performance (Test Set)")
-    st.markdown(f"**Model:** Gradient Boosting  \n**Optimal Threshold:** {threshold:.2f}")
+    st.subheader("Out-of-Sample Model Performance (Post-1990)")
+
+    probs = model.predict_proba(Xs_test)[:, 1]
+    preds = (probs >= risk_threshold).astype(int)
+
+    col1, col2, col3, col4 = st.columns(4)
+
+    col1.metric("ROC-AUC", f"{roc_auc_score(y_test, probs):.3f}")
+    col2.metric("PR-AUC", f"{average_precision_score(y_test, probs):.3f}")
+    col3.metric("Recall", f"{recall_score(y_test, preds):.3f}")
+    col4.metric("F1 Score", f"{f1_score(y_test, preds):.3f}")
 
 # ======================================================================
 # TAB 2 – RISK TIMELINE
 # ======================================================================
 with tab2:
-    for c in ["USA", "UK", "Canada"]:
+    st.subheader("Financial Crisis Risk Timeline")
+
+    for c in selected_countries:
         df_c = df_full[df_full["country"] == c]
 
         X = df_c.drop(columns=["target", "crisisJST", "country", "year"])
         Xs = scaler.transform(X)
         probs = model.predict_proba(Xs)[:, 1]
 
-        fig, ax = plt.subplots(figsize=(10, 3))
-        ax.plot(df_c["year"], probs, lw=2)
-        ax.axhline(threshold, linestyle="--")
+        fig, ax = plt.subplots(figsize=(11, 3))
+        ax.plot(df_c["year"], probs, lw=2, label="Predicted Crisis Probability")
+        ax.axhline(risk_threshold, linestyle="--", color="black", label="Risk Threshold")
 
-        for y in df_c[df_c["crisisJST"] == 1]["year"]:
-            ax.axvspan(y-0.5, y+0.5, color="red", alpha=0.2)
+        if show_crises:
+            for y in df_c[df_c["crisisJST"] == 1]["year"]:
+                ax.axvspan(y-0.5, y+0.5, color="red", alpha=0.25)
 
-        ax.set_title(c)
+        ax.set_title(f"{c}")
         ax.set_ylim(0, 1)
+        ax.legend(loc="upper left")
+
         st.pyplot(fig)
 
 # ======================================================================
 # TAB 3 – UPLOAD & PREDICT
 # ======================================================================
 with tab3:
-    uploaded = st.file_uploader("Upload CSV", type=["csv"])
+    st.subheader("Upload New Data for Prediction")
+
+    uploaded = st.file_uploader("Upload CSV file", type=["csv"])
 
     if uploaded:
         user_df = pd.read_csv(uploaded)
 
-        required = set(feature_cols) | {
+        required_cols = set(feature_cols) | {
             "country","year","lev","noncore","ltd","hpnom","cpi",
             "tloans","ltrate","stir","money","gdp","ca"
         }
 
-        if not required.issubset(user_df.columns):
-            st.error("Uploaded file missing required columns.")
+        if not required_cols.issubset(user_df.columns):
+            st.error("Uploaded file is missing required columns.")
         else:
             df_u, _ = engineer_features(user_df)
             df_u = clean_data(df_u)
@@ -245,15 +281,24 @@ with tab3:
             Xs_u = scaler.transform(X_u)
 
             probs_u = model.predict_proba(Xs_u)[:, 1]
-            preds_u = (probs_u >= threshold).astype(int)
+            preds_u = (probs_u >= risk_threshold).astype(int)
 
             df_u["predicted_prob"] = probs_u
             df_u["predicted_class"] = preds_u
 
-            st.dataframe(df_u[["country","year","predicted_prob","predicted_class"]])
+            st.success(
+                f"{preds_u.sum()} high-risk observations detected "
+                f"({100 * preds_u.mean():.1f}%)"
+            )
+
+            st.dataframe(
+                df_u[["country","year","predicted_prob","predicted_class"]],
+                use_container_width=True
+            )
 
 # ======================================================================
 # TAB 4 – DATA EXPLORER
 # ======================================================================
 with tab4:
-    st.dataframe(df_full.tail(50))
+    st.subheader("Processed Dataset (Preview)")
+    st.dataframe(df_full.tail(50), use_container_width=True)
