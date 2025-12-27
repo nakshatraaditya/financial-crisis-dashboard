@@ -1,19 +1,19 @@
 # ======================================================================
 #  FINANCIAL CRISIS EARLY WARNING SYSTEM – STREAMLIT DASHBOARD
-#  Dissertation-Ready | Senior Data Scientist Implementation
+#  Interactive Plotly Version | Dissertation-Ready
 # ======================================================================
 
 import streamlit as st
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
+import plotly.graph_objects as go
 
 from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import (
     roc_auc_score, recall_score, f1_score,
     average_precision_score
 )
-from sklearn.preprocessing import StandardScaler
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -27,7 +27,7 @@ st.set_page_config(
 )
 
 st.title("📉 Financial Crisis Early Warning System")
-st.caption("USA · UK · Canada | 1870–2020 | Dissertation Dashboard")
+st.caption("USA · UK · Canada | 1870–2020 | Interactive Dissertation Dashboard")
 
 # ======================================================================
 # SIDEBAR CONTROLS
@@ -42,10 +42,7 @@ selected_countries = st.sidebar.multiselect(
 
 risk_threshold = st.sidebar.slider(
     "Risk Threshold",
-    min_value=0.05,
-    max_value=0.9,
-    value=0.20,
-    step=0.01
+    0.05, 0.9, 0.20, 0.01
 )
 
 show_crises = st.sidebar.checkbox(
@@ -102,7 +99,7 @@ def engineer_features(df):
     # --- Yield curve ---
     df["yield_curve"] = df["ltrate"] - df["stir"]
 
-    # --- Sovereign spread (vs USA) ---
+    # --- Sovereign spread vs USA ---
     us_ltrate = (
         df[df["country"] == "USA"]
         .drop_duplicates("year")
@@ -132,7 +129,7 @@ def engineer_features(df):
 def clean_data(df):
     df = df.copy()
 
-    # Remove world war distortion
+    # Remove wartime distortions
     df = df[~df["year"].between(1914, 1918)]
     df = df[~df["year"].between(1939, 1945)]
 
@@ -181,12 +178,12 @@ def train_model():
     X_train = train.drop(columns=["target", "crisisJST", "country", "year"])
     y_train = train["target"]
 
-    X_test  = test.drop(columns=["target", "crisisJST", "country", "year"])
-    y_test  = test["target"]
+    X_test = test.drop(columns=["target", "crisisJST", "country", "year"])
+    y_test = test["target"]
 
     scaler = StandardScaler()
     Xs_train = scaler.fit_transform(X_train)
-    Xs_test  = scaler.transform(X_test)
+    Xs_test = scaler.transform(X_test)
 
     model = GradientBoostingClassifier(
         n_estimators=400,
@@ -197,10 +194,10 @@ def train_model():
 
     model.fit(Xs_train, y_train)
 
-    return model, scaler, df, X_test.columns, y_test, Xs_test
+    return model, scaler, df, Xs_test, y_test, X_test.columns
 
 
-model, scaler, df_full, feature_cols, y_test, Xs_test = train_model()
+model, scaler, df_full, Xs_test, y_test, feature_cols = train_model()
 
 # ======================================================================
 # TABS
@@ -216,50 +213,77 @@ tab1, tab2, tab3, tab4 = st.tabs([
 # TAB 1 – MODEL RESULTS
 # ======================================================================
 with tab1:
-    st.subheader("Out-of-Sample Model Performance (Post-1990)")
+    st.subheader("Out-of-Sample Performance (Post-1990)")
 
     probs = model.predict_proba(Xs_test)[:, 1]
     preds = (probs >= risk_threshold).astype(int)
 
-    col1, col2, col3, col4 = st.columns(4)
+    c1, c2, c3, c4 = st.columns(4)
 
-    col1.metric("ROC-AUC", f"{roc_auc_score(y_test, probs):.3f}")
-    col2.metric("PR-AUC", f"{average_precision_score(y_test, probs):.3f}")
-    col3.metric("Recall", f"{recall_score(y_test, preds):.3f}")
-    col4.metric("F1 Score", f"{f1_score(y_test, preds):.3f}")
+    c1.metric("ROC-AUC", f"{roc_auc_score(y_test, probs):.3f}")
+    c2.metric("PR-AUC", f"{average_precision_score(y_test, probs):.3f}")
+    c3.metric("Recall", f"{recall_score(y_test, preds):.3f}")
+    c4.metric("F1 Score", f"{f1_score(y_test, preds):.3f}")
 
 # ======================================================================
-# TAB 2 – RISK TIMELINE
+# TAB 2 – INTERACTIVE RISK TIMELINE
 # ======================================================================
 with tab2:
-    st.subheader("Financial Crisis Risk Timeline")
+    st.subheader("Interactive Crisis Risk Timeline")
 
     for c in selected_countries:
-        df_c = df_full[df_full["country"] == c]
+        df_c = df_full[df_full["country"] == c].copy()
 
         X = df_c.drop(columns=["target", "crisisJST", "country", "year"])
         Xs = scaler.transform(X)
-        probs = model.predict_proba(Xs)[:, 1]
+        df_c["crisis_prob"] = model.predict_proba(Xs)[:, 1]
 
-        fig, ax = plt.subplots(figsize=(11, 3))
-        ax.plot(df_c["year"], probs, lw=2, label="Predicted Crisis Probability")
-        ax.axhline(risk_threshold, linestyle="--", color="black", label="Risk Threshold")
+        fig = go.Figure()
+
+        fig.add_trace(
+            go.Scatter(
+                x=df_c["year"],
+                y=df_c["crisis_prob"],
+                mode="lines",
+                name="Predicted Crisis Probability",
+                hovertemplate="Year: %{x}<br>Risk: %{y:.2f}<extra></extra>"
+            )
+        )
+
+        fig.add_hline(
+            y=risk_threshold,
+            line_dash="dash",
+            line_color="black",
+            annotation_text="Risk Threshold"
+        )
 
         if show_crises:
             for y in df_c[df_c["crisisJST"] == 1]["year"]:
-                ax.axvspan(y-0.5, y+0.5, color="red", alpha=0.25)
+                fig.add_vrect(
+                    x0=y - 0.5,
+                    x1=y + 0.5,
+                    fillcolor="red",
+                    opacity=0.25,
+                    line_width=0
+                )
 
-        ax.set_title(f"{c}")
-        ax.set_ylim(0, 1)
-        ax.legend(loc="upper left")
+        fig.update_layout(
+            title=f"{c} – Crisis Risk Timeline",
+            xaxis_title="Year",
+            yaxis_title="Crisis Probability",
+            yaxis=dict(range=[0, 1]),
+            hovermode="x unified",
+            height=350,
+            template="plotly_white"
+        )
 
-        st.pyplot(fig)
+        st.plotly_chart(fig, use_container_width=True)
 
 # ======================================================================
 # TAB 3 – UPLOAD & PREDICT
 # ======================================================================
 with tab3:
-    st.subheader("Upload New Data for Prediction")
+    st.subheader("Upload Data for Prediction")
 
     uploaded = st.file_uploader("Upload CSV file", type=["csv"])
 
@@ -280,15 +304,12 @@ with tab3:
             X_u = df_u.drop(columns=["country","year","crisisJST"], errors="ignore")
             Xs_u = scaler.transform(X_u)
 
-            probs_u = model.predict_proba(Xs_u)[:, 1]
-            preds_u = (probs_u >= risk_threshold).astype(int)
-
-            df_u["predicted_prob"] = probs_u
-            df_u["predicted_class"] = preds_u
+            df_u["predicted_prob"] = model.predict_proba(Xs_u)[:, 1]
+            df_u["predicted_class"] = (df_u["predicted_prob"] >= risk_threshold).astype(int)
 
             st.success(
-                f"{preds_u.sum()} high-risk observations detected "
-                f"({100 * preds_u.mean():.1f}%)"
+                f"{df_u['predicted_class'].sum()} high-risk observations detected "
+                f"({100 * df_u['predicted_class'].mean():.1f}%)"
             )
 
             st.dataframe(
@@ -300,5 +321,5 @@ with tab3:
 # TAB 4 – DATA EXPLORER
 # ======================================================================
 with tab4:
-    st.subheader("Processed Dataset (Preview)")
+    st.subheader("Processed Dataset Preview")
     st.dataframe(df_full.tail(50), use_container_width=True)
