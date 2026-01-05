@@ -4,5 +4,6 @@ numpy
 matplotlib
 seaborn
 scikit-learn
+plotly
 shap
 openpyxl
