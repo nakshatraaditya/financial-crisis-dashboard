@@ -2,27 +2,18 @@
 #  FINANCIAL CRISIS EARLY WARNING SYSTEM – STREAMLIT DASHBOARD
 #  (FULL UPDATED VERSION)
 #
-#  What’s new (your request):
-#   ✅ If you upload a country (e.g., Spain), Tab 1 will switch to show the
-#      uploaded country predictions instead of USA/UK/Canada.
-#   ✅ You can toggle Tab 1 data source in the sidebar:
-#      - Training (USA/UK/Canada)
-#      - Uploaded (your CSV)
-#   ✅ Tab 1 charts + summary automatically adapt to uploaded country + years
-#   ✅ Uploaded macro charts (GDP + real house prices) use your uploaded CSV
-#      (gdp, hpnom, cpi), so they show for Spain too.
+#  NEW (your request):
+#   ✅ On the Tab 1 crisis-risk line chart, crisis years present in the data
+#      are now highlighted as shaded vertical bands (one band per crisis year).
+#   ✅ Works for:
+#      - Training view (USA/UK/Canada): uses crisisJST from JST
+#      - Uploaded view: if your uploaded CSV includes crisisJST, those years are shaded too
 #
-#  Spain upload crash fix kept:
-#   ✅ No NaN/Inf passed into model in Upload & Predict
-#   ✅ Sovereign spread uses USA long-rate mapping from JST training data
-#   ✅ Remaining NaNs filled using training medians (fallback 0)
-#
-#  Other features preserved:
-#   ✅ Multi-model training + best model selection (validation)
-#   ✅ Threshold slider
-#   ✅ RGB-consistent colors for country charts (Altair) + deterministic colors for new countries
-#   ✅ Risk summary as PERCENTAGE
-#   ✅ SHAP interactive pie (Plotly if installed) + explanation under it
+#  Everything else preserved:
+#   ✅ Upload replaces Tab 1 countries when selected
+#   ✅ Spain-upload NaN/Inf crash fix kept (robust upload)
+#   ✅ GDP + Real house prices chart for whichever dataset is active
+#   ✅ SHAP pie + explanation under it
 # ======================================================================
 
 import streamlit as st
@@ -114,7 +105,7 @@ with st.sidebar:
 # ======================================================================
 
 def stable_rgb(name: str) -> str:
-    """Deterministic RGB for any unseen country label (so Spain isn’t grey)."""
+    """Deterministic RGB for any unseen country label (so new countries get a consistent color)."""
     h = abs(hash(name))
     r = 60 + (h % 140)
     g = 60 + ((h // 140) % 140)
@@ -125,50 +116,91 @@ def build_color_scale(categories):
     """Return (domain, range_colors) using base RGB + deterministic for new countries."""
     cats = [str(c) for c in categories]
     domain = []
-    # keep base order first if present
     for c in BASE_COUNTRY_ORDER:
         if c in cats and c not in domain:
             domain.append(c)
-    # then others sorted
     for c in sorted(set(cats)):
         if c not in domain:
             domain.append(c)
-
     range_colors = [BASE_COUNTRY_RGB.get(c, stable_rgb(c)) for c in domain]
     return domain, range_colors
 
-def altair_line_chart(df: pd.DataFrame, x_col: str, y_col: str, color_col: str, title: str = ""):
-    """Interactive line with fixed RGB colors (Altair). Falls back to st.line_chart if Altair missing."""
+def altair_line_chart_with_crisis(
+    df: pd.DataFrame,
+    x_col: str,
+    y_col: str,
+    color_col: str,
+    title: str = "",
+    crisis_df: pd.DataFrame | None = None,
+):
+    """
+    Interactive line chart with consistent colors.
+    If crisis_df is provided with columns [country, year], draws shaded bands for those crisis years.
+    """
     if df is None or df.empty:
         st.info("No data to plot.")
         return
 
     if not ALTAIR_OK:
+        # fallback (no custom colors or shaded bands)
         st.line_chart(df, x=x_col, y=y_col, color=color_col)
         return
 
     domain, range_colors = build_color_scale(df[color_col].unique())
 
-    chart = (
-        alt.Chart(df)
-        .mark_line(point=False)
-        .encode(
-            x=alt.X(f"{x_col}:Q", title=x_col),
-            y=alt.Y(f"{y_col}:Q", title=y_col),
-            color=alt.Color(
-                f"{color_col}:N",
-                scale=alt.Scale(domain=domain, range=range_colors),
-                legend=alt.Legend(title=color_col),
-            ),
-            tooltip=[
-                alt.Tooltip(f"{color_col}:N"),
-                alt.Tooltip(f"{x_col}:Q"),
-                alt.Tooltip(f"{y_col}:Q", format=".6f"),
-            ],
+    base = alt.Chart(df).encode(
+        x=alt.X(f"{x_col}:Q", title=x_col),
+        y=alt.Y(f"{y_col}:Q", title=y_col),
+        color=alt.Color(
+            f"{color_col}:N",
+            scale=alt.Scale(domain=domain, range=range_colors),
+            legend=alt.Legend(title=color_col),
+        ),
+        tooltip=[
+            alt.Tooltip(f"{color_col}:N"),
+            alt.Tooltip(f"{x_col}:Q"),
+            alt.Tooltip(f"{y_col}:Q", format=".6f"),
+        ],
+    )
+
+    line = base.mark_line(point=False)
+
+    layers = []
+
+    # Crisis-year shading (vertical bands)
+    if crisis_df is not None and not crisis_df.empty:
+        cdf = crisis_df.copy()
+        cdf[color_col] = cdf[color_col].astype(str)
+
+        # Create start/end of band around each crisis year
+        cdf["x_start"] = cdf["year"] - 0.5
+        cdf["x_end"] = cdf["year"] + 0.5
+
+        rect = (
+            alt.Chart(cdf)
+            .mark_rect(opacity=0.15)
+            .encode(
+                x=alt.X("x_start:Q", title=None),
+                x2="x_end:Q",
+                y=alt.value(0),
+                y2=alt.value(1),
+                color=alt.Color(
+                    f"{color_col}:N",
+                    scale=alt.Scale(domain=domain, range=range_colors),
+                    legend=None,
+                ),
+            )
         )
+        layers.append(rect)
+
+    layers.append(line)
+
+    chart = (
+        alt.layer(*layers)
         .properties(height=320, title=title)
         .interactive()
     )
+
     st.altair_chart(chart, use_container_width=True)
 
 # ======================================================================
@@ -488,7 +520,8 @@ def run_upload_predict_sidebar(
         return None
 
     # Build uploaded macro series for Tab 1
-    macro = user_df[["country", "year", "gdp", "hpnom", "cpi"]].copy()
+    macro_cols = ["country", "year", "gdp", "hpnom", "cpi"]
+    macro = user_df[macro_cols].copy()
     macro["country"] = macro["country"].astype(str).str.strip()
     macro["house_price_real"] = macro["hpnom"] / (macro["cpi"] + 1e-9)
     macro = macro.sort_values(["country", "year"])
@@ -510,7 +543,6 @@ def run_upload_predict_sidebar(
         if miss_col not in df_clean.columns:
             df_clean[miss_col] = 0
 
-    # Build matrix in exact training order
     for f in all_features:
         if f not in df_clean.columns:
             df_clean[f] = 0
@@ -532,17 +564,18 @@ def run_upload_predict_sidebar(
 
     preds = (probs >= threshold).astype(int)
 
+    # IMPORTANT: keep crisisJST if user uploaded it (enables crisis shading on Tab 1)
     out = df_clean[["country", "year"]].copy()
+    if "crisisJST" in df_clean.columns:
+        out["crisisJST"] = df_clean["crisisJST"].astype(int)
+
     out["predicted_prob"] = probs
     out["predicted_class"] = preds
     out = out.sort_values(["country", "year"])
 
     st.sidebar.success(f"{int(preds.sum())} high-risk rows ({100 * preds.mean():.1f}%)")
 
-    return {
-        "preds": out,
-        "macro": macro
-    }
+    return {"preds": out, "macro": macro}
 
 # ======================================================================
 # 5) SHAP PIE (cached)
@@ -605,7 +638,7 @@ base_feature_medians = bundle["base_feature_medians"]
 macro_train_df = get_jst_macro_series(str(JST_XLSX))
 
 # ======================================================================
-# 7) SIDEBAR CONTROLS (model first, upload, then Tab 1 data source)
+# 7) SIDEBAR CONTROLS
 # ======================================================================
 
 st.sidebar.header("🎛️ Model & Filters")
@@ -634,7 +667,6 @@ threshold = st.sidebar.slider(
 st.sidebar.subheader("🧠 SHAP Pie (first page)")
 shap_pie_sample_n = st.sidebar.slider("SHAP sample size", 50, 400, 150, 25)
 
-# Upload & predict bundle
 uploaded_bundle = run_upload_predict_sidebar(
     selected_model=selected_model,
     scaler=scaler,
@@ -646,7 +678,6 @@ uploaded_bundle = run_upload_predict_sidebar(
     base_feature_medians=base_feature_medians,
 )
 
-# Data source for Tab 1
 st.sidebar.subheader("📌 Tab 1 view")
 if uploaded_bundle is not None:
     tab1_source = st.sidebar.radio(
@@ -665,7 +696,7 @@ else:
 
 use_uploaded_on_tab1 = (tab1_source.startswith("Uploaded") and uploaded_bundle is not None)
 
-# Filters for Tab 1 (change depending on source)
+# Tab 1 filters switch depending on source
 if use_uploaded_on_tab1:
     preds_u = uploaded_bundle["preds"]
     countries_u = sorted(preds_u["country"].unique())
@@ -687,7 +718,7 @@ if use_uploaded_on_tab1:
         key="uploaded_year_slider"
     )
 
-    show_crisis_years = False  # crisisJST not present/reliable in uploads
+    show_crisis_years = False
 else:
     view_countries = st.sidebar.multiselect(
         "Countries (training timeline)",
@@ -710,19 +741,29 @@ else:
     show_crisis_years = st.sidebar.checkbox("Show crisis years list (training)", value=True)
 
 # ======================================================================
-# 8) BUILD TAB 1 DISPLAY DF
+# 8) BUILD TAB 1 DISPLAY + CRISIS-YEAR DF
 # ======================================================================
+
+crisis_years_df = pd.DataFrame(columns=["country", "year"])  # default empty
 
 if use_uploaded_on_tab1:
     preds_u = uploaded_bundle["preds"].copy()
+
     display_df = preds_u[
         (preds_u["country"].isin(view_countries)) &
         (preds_u["year"] >= from_year) &
         (preds_u["year"] <= to_year)
     ].copy()
 
-    # unify column name for charting
     display_df["crisis_prob"] = display_df["predicted_prob"]
+
+    # crisis years only if uploaded had crisisJST
+    if "crisisJST" in display_df.columns:
+        crisis_years_df = (
+            display_df[display_df["crisisJST"] == 1][["country", "year"]]
+            .drop_duplicates()
+            .copy()
+        )
 
     macro_df = uploaded_bundle["macro"].copy()
     macro_df = macro_df[
@@ -738,9 +779,14 @@ else:
         (df_target["year"] <= to_year)
     ].copy()
 
-    # compute probs for training timeline
     scaled = X_full_scaled[display_df.index.to_numpy()]
     display_df["crisis_prob"] = selected_model.predict_proba(scaled)[:, 1]
+
+    crisis_years_df = (
+        display_df[display_df["crisisJST"] == 1][["country", "year"]]
+        .drop_duplicates()
+        .copy()
+    )
 
     macro_df = macro_train_df[
         (macro_train_df["country"].isin(view_countries)) &
@@ -761,19 +807,21 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
 ])
 
 # -----------------------------------------------------------------------------
-# TAB 1: NOW ADAPTS TO UPLOAD OR TRAINING
+# TAB 1: Crisis Risk + crisis-year shading
 with tab1:
     st.header("Crisis risk over time", divider="gray")
 
     if display_df.empty:
         st.warning("No data for the selected filters.")
     else:
-        altair_line_chart(
+        # ✅ NOW includes shaded crisis-year bands
+        altair_line_chart_with_crisis(
             display_df.sort_values(["country", "year"]),
             x_col="year",
             y_col="crisis_prob",
             color_col="country",
-            title="Predicted crisis probability over time"
+            title="Predicted crisis probability over time (shaded bands = crisis years in data)",
+            crisis_df=crisis_years_df
         )
 
         st.write("")
@@ -798,6 +846,7 @@ with tab1:
                         delta_color="inverse" if val >= threshold else "normal",
                     )
 
+        # optional list (training only)
         if (not use_uploaded_on_tab1) and show_crisis_years:
             with st.expander("Crisis years in selected window (training only)"):
                 for c in view_countries:
@@ -809,16 +858,16 @@ with tab1:
 
         left, right = st.columns(2)
 
-        # LEFT: GDP + house prices for whichever dataset is active
         with left:
             st.markdown("### 🌍 GDP")
             if "gdp" in macro_df.columns and not macro_df["gdp"].isna().all():
-                altair_line_chart(
+                altair_line_chart_with_crisis(
                     macro_df.sort_values(["country", "year"]),
                     x_col="year",
                     y_col="gdp",
                     color_col="country",
-                    title="GDP"
+                    title="GDP (shaded bands = crisis years if available)",
+                    crisis_df=crisis_years_df if not crisis_years_df.empty else None
                 )
             else:
                 st.info("GDP not available for the selected data / years.")
@@ -826,17 +875,17 @@ with tab1:
             st.write("")
             st.markdown("### 🏠 Real house prices (hpnom / cpi)")
             if "house_price_real" in macro_df.columns and not macro_df["house_price_real"].isna().all():
-                altair_line_chart(
+                altair_line_chart_with_crisis(
                     macro_df.sort_values(["country", "year"]),
                     x_col="year",
                     y_col="house_price_real",
                     color_col="country",
-                    title="Real house prices"
+                    title="Real house prices (shaded bands = crisis years if available)",
+                    crisis_df=crisis_years_df if not crisis_years_df.empty else None
                 )
             else:
                 st.info("House price data not available for the selected data / years.")
 
-        # RIGHT: SHAP pie + explanation
         with right:
             st.markdown("### 🧠 SHAP Explainability")
             st.caption("Pie uses **mean(|SHAP|)** across sampled test rows (share of total influence).")
@@ -899,14 +948,12 @@ with tab1:
                 st.markdown(
                     """
 **What SHAP values represent**
-
-- SHAP decomposes a model prediction into **feature contributions** around a baseline.  
+- SHAP decomposes a prediction into **feature contributions** around a baseline.  
 - **Positive SHAP** pushes predicted crisis risk **up**; **negative SHAP** pushes it **down**.  
 - Larger **|SHAP|** means **stronger influence**.
 
 **What this pie chart shows**
-
-This pie uses **mean(|SHAP|)** over many observations, so it is **global importance** (share of total influence).  
+This pie uses **mean(|SHAP|)** over many observations → **global importance** (share of total influence).  
 It shows *how much* a feature matters overall, not the direction of its effect.
 """
                 )
@@ -955,7 +1002,7 @@ with tab2:
     st.dataframe(cm_df, use_container_width=True)
 
 # -----------------------------------------------------------------------------
-# TAB 3: Uploaded Predictions (still available)
+# TAB 3: Uploaded Predictions
 with tab3:
     st.header("Predictions from uploaded CSV", divider="gray")
 
@@ -967,12 +1014,16 @@ with tab3:
 
         st.write("")
         st.subheader("Uploaded risk over time", divider="gray")
-        altair_line_chart(
-            uploaded_preds.sort_values(["country", "year"]),
+        altair_line_chart_with_crisis(
+            uploaded_preds.sort_values(["country", "year"]).assign(crisis_prob=lambda d: d["predicted_prob"]),
             x_col="year",
-            y_col="predicted_prob",
+            y_col="crisis_prob",
             color_col="country",
-            title="Uploaded predicted crisis probability over time"
+            title="Uploaded predicted crisis probability (shaded bands only if crisisJST exists in upload)",
+            crisis_df=(
+                uploaded_preds[uploaded_preds.get("crisisJST", 0) == 1][["country", "year"]].drop_duplicates()
+                if "crisisJST" in uploaded_preds.columns else None
+            )
         )
 
         csv_bytes = uploaded_preds.to_csv(index=False).encode("utf-8")
