@@ -1,21 +1,21 @@
 # ======================================================================
 #  FINANCIAL CRISIS EARLY WARNING SYSTEM – STREAMLIT DASHBOARD
-#  Uses YOUR multi-model pipeline:
-#   - Missing-value flags
-#   - Proper scaling (continuous only)
-#   - Multi-model validation + best model selection
-#   - SHAP explainability
+#  (FULL FIXED VERSION)
 #
-#  Current updates:
-#   ✅ GDP chart uses JSTdatasetR6.xlsx (NO external gdp_data.csv needed)
-#   ✅ SHAP pie chart shown on FIRST page (interactive if Plotly installed)
-#   ✅ Pie chart visibility fixed + SHAP explanation under the pie
-#   ✅ results_df Arrow-safe (no sklearn objects inside dataframe)
+#  Fixes included for your Spain upload error:
+#   ✅ No NaN/Inf passed into model during Upload & Predict
+#   ✅ Sovereign spread now uses USA long-rate mapping from JST training data
+#      (works even if uploaded file does NOT contain USA)
+#   ✅ Any remaining NaNs are filled using training medians (fallback to 0)
+#   ✅ Upload errors are shown nicely in the sidebar instead of crashing
 #
-#  NEW changes (requested):
-#   ✅ Consistent RGB color mapping for USA/UK/Canada across ALL country charts
-#      (implemented using Altair so we can control colors)
-#   ✅ Crisis summary shown as PERCENTAGE (and delta vs threshold in percentage points)
+#  Other features preserved:
+#   ✅ Multi-model training + best model selection (validation)
+#   ✅ Threshold slider
+#   ✅ RGB-consistent colors for country charts (Altair)
+#   ✅ Risk summary as PERCENTAGE
+#   ✅ JST GDP + Real House Prices charts
+#   ✅ SHAP interactive pie (Plotly if installed) + explanation under it
 # ======================================================================
 
 import streamlit as st
@@ -32,7 +32,7 @@ try:
 except Exception:
     PLOTLY_OK = False
 
-# Altair for RGB-controlled charts (recommended for consistent colors)
+# Altair for RGB-controlled charts
 try:
     import altair as alt
     ALTAIR_OK = True
@@ -72,12 +72,11 @@ JST_XLSX = APP_DIR / "JSTdatasetR6.xlsx"
 
 # -----------------------------------------------------------------------------
 # RGB COLOR MAP (consistent across all charts)
-# You can change these RGBs to match your dissertation theme.
 COUNTRY_ORDER = ["USA", "UK", "Canada"]
 COUNTRY_RGB = {
-    "USA": "rgb(255, 99, 71)",     # Tomato
-    "UK": "rgb(100, 149, 237)",    # Cornflower Blue
-    "Canada": "rgb(60, 179, 113)", # Medium Sea Green
+    "USA": "rgb(255, 99, 71)",      # Tomato
+    "UK": "rgb(100, 149, 237)",     # Cornflower Blue
+    "Canada": "rgb(60, 179, 113)",  # Medium Sea Green
 }
 
 # -----------------------------------------------------------------------------
@@ -108,25 +107,17 @@ with st.sidebar:
 # ======================================================================
 
 def altair_line_chart(df: pd.DataFrame, x_col: str, y_col: str, color_col: str, title: str = ""):
-    """
-    Draws a line chart with consistent RGB colors by country (Altair).
-    Falls back to st.line_chart if Altair isn't available.
-    """
     if df is None or df.empty:
         st.info("No data to plot.")
         return
 
     if not ALTAIR_OK:
-        # Fallback (no custom colors)
         st.line_chart(df, x=x_col, y=y_col, color=color_col)
         return
 
     domain = [c for c in COUNTRY_ORDER if c in df[color_col].unique()]
-    # Add any extra categories (e.g., uploaded unexpected labels) deterministically
     extra = [c for c in sorted(df[color_col].unique()) if c not in domain]
     domain = domain + extra
-
-    # Colors for known + fallback for unknown
     range_colors = [COUNTRY_RGB.get(c, "rgb(180,180,180)") for c in domain]
 
     chart = (
@@ -140,14 +131,17 @@ def altair_line_chart(df: pd.DataFrame, x_col: str, y_col: str, color_col: str, 
                 scale=alt.Scale(domain=domain, range=range_colors),
                 legend=alt.Legend(title=color_col),
             ),
-            tooltip=[alt.Tooltip(f"{color_col}:N"), alt.Tooltip(f"{x_col}:Q"), alt.Tooltip(f"{y_col}:Q", format=".4f")],
+            tooltip=[
+                alt.Tooltip(f"{color_col}:N"),
+                alt.Tooltip(f"{x_col}:Q"),
+                alt.Tooltip(f"{y_col}:Q", format=".6f"),
+            ],
         )
         .properties(height=320, title=title)
         .interactive()
     )
 
     st.altair_chart(chart, use_container_width=True)
-
 
 # ======================================================================
 # 1) JST MACRO DATA (GDP + House prices) FOR CHARTS
@@ -166,12 +160,10 @@ def get_jst_macro_series(jst_path: str) -> pd.DataFrame:
 
     out = df[keep_cols].copy()
 
-    # Real house prices (if possible)
     if "hpnom" in out.columns and "cpi" in out.columns:
         out["house_price_real"] = out["hpnom"] / (out["cpi"] + 1e-9)
 
     return out
-
 
 # ======================================================================
 # 2) YOUR PIPELINE FUNCTIONS
@@ -184,12 +176,19 @@ def load_data(file="JSTdatasetR6.xlsx"):
     return df
 
 
-def engineer_features(df):
+def engineer_features(df, us_ltrate_map: dict | None = None):
+    """
+    If us_ltrate_map is provided, sovereign_spread uses USA long rate from that mapping.
+    This prevents Spain (or any single-country upload) from producing all-NaN sovereign_spread.
+    """
     df = df.copy()
 
     # allow uploads without crisisJST
     if "crisisJST" not in df.columns:
         df["crisisJST"] = 0
+
+    # basic safeguards
+    df["country"] = df["country"].astype(str).str.strip()
 
     df["leverage_risk"] = 1 / (df["lev"] + 0.01)
 
@@ -221,13 +220,22 @@ def engineer_features(df):
 
     df["yield_curve"] = df["ltrate"] - df["stir"]
 
-    us_ltrate = (
-        df[df["country"] == "USA"]
-        .drop_duplicates("year")
-        .set_index("year")["ltrate"]
-        .to_dict()
-    )
-    df["us_ltrate"] = df["year"].map(us_ltrate)
+    # --- sovereign spread ---
+    # Training: map is provided from JST USA ltrate series.
+    # Upload: use that map too (so Spain works).
+    if us_ltrate_map is None:
+        # fallback: compute from df if USA exists, else empty dict
+        if "USA" in set(df["country"].unique()):
+            us_ltrate_map = (
+                df[df["country"] == "USA"]
+                .drop_duplicates("year")
+                .set_index("year")["ltrate"]
+                .to_dict()
+            )
+        else:
+            us_ltrate_map = {}
+
+    df["us_ltrate"] = df["year"].map(us_ltrate_map) if isinstance(us_ltrate_map, dict) else np.nan
     df["sovereign_spread"] = df["ltrate"] - df["us_ltrate"]
 
     df["money_gdp"] = df["money"] / (df["gdp"] + 1e-9)
@@ -253,16 +261,16 @@ def clean_data(df, base_features):
     df = df[~df["year"].between(1914, 1918)]
     df = df[~df["year"].between(1939, 1945)]
 
-    # Missing flags
+    # Missing flags BEFORE imputation
     for col in base_features:
         df[f"{col}_missing"] = df[col].isna().astype(int)
 
-    # Causal fill
+    # Causal fill (within-country)
     df[base_features] = df.groupby("country")[base_features].transform(
         lambda x: x.ffill(limit=3).bfill(limit=3)
     )
 
-    # Median fallback
+    # Country median fallback
     df[base_features] = df.groupby("country")[base_features].transform(
         lambda x: x.fillna(x.median())
     )
@@ -339,15 +347,25 @@ def evaluate_model(name, model, X_tr, y_tr, X_val, y_val):
         "clf": model
     }
 
-
 # ======================================================================
 # 3) TRAINING + CACHING
 # ======================================================================
 
 @st.cache_resource
 def train_pipeline(jst_path: str):
+    # Load JST (USA/UK/Canada)
     df_raw = load_data(jst_path)
-    df_feat, base_features = engineer_features(df_raw)
+
+    # USA long-rate map from JST (used later for uploads too)
+    us_ltrate_map = (
+        df_raw[df_raw["country"] == "USA"]
+        .drop_duplicates("year")
+        .set_index("year")["ltrate"]
+        .to_dict()
+    )
+
+    # Feature engineering with stable USA map
+    df_feat, base_features = engineer_features(df_raw, us_ltrate_map=us_ltrate_map)
     df_clean = clean_data(df_feat, base_features)
 
     # reset index so alignment by row-position is safe
@@ -368,6 +386,9 @@ def train_pipeline(jst_path: str):
     y_val   = val["target"]
     y_test  = test["target"]
 
+    # Global medians (used as robust fallback for uploads)
+    base_feature_medians = df_target[base_features].median(numeric_only=True).to_dict()
+
     scaler = StandardScaler()
     Xs_train_cont = scaler.fit_transform(X_train[base_features])
     Xs_val_cont   = scaler.transform(X_val[base_features])
@@ -383,8 +404,7 @@ def train_pipeline(jst_path: str):
     for name, clf in build_model_set().items():
         res = evaluate_model(name, clf, Xs_train, y_train, Xs_val, y_val)
         fitted_models[name] = res["clf"]
-        # Arrow-safe (exclude model object)
-        results.append({k: v for k, v in res.items() if k != "clf"})
+        results.append({k: v for k, v in res.items() if k != "clf"})  # Arrow-safe
 
     results_df = pd.DataFrame(results).sort_values("F1", ascending=False).reset_index(drop=True)
 
@@ -413,14 +433,24 @@ def train_pipeline(jst_path: str):
         "y_test": y_test.to_numpy(),
         "X_full_scaled": X_full_scaled,
         "test_probs_by_model": test_probs_by_model,
+        "us_ltrate_map": us_ltrate_map,
+        "base_feature_medians": base_feature_medians,
     }
 
-
 # ======================================================================
-# 4) SIDEBAR UPLOAD & PREDICT
+# 4) SIDEBAR UPLOAD & PREDICT (ROBUST TO SPAIN / ANY COUNTRY)
 # ======================================================================
 
-def run_upload_predict_sidebar(selected_model, scaler, threshold, base_features, missing_features, all_features):
+def run_upload_predict_sidebar(
+    selected_model,
+    scaler,
+    threshold,
+    base_features,
+    missing_features,
+    all_features,
+    us_ltrate_map,
+    base_feature_medians,
+):
     st.sidebar.header("📥 Upload & Predict")
 
     uploaded = st.sidebar.file_uploader("Upload CSV", type=["csv"], key="upload_csv")
@@ -429,29 +459,78 @@ def run_upload_predict_sidebar(selected_model, scaler, threshold, base_features,
         st.sidebar.info("Upload a CSV to generate predictions.")
         return None
 
-    user_df = pd.read_csv(uploaded)
+    try:
+        user_df = pd.read_csv(uploaded)
+    except Exception as e:
+        st.sidebar.error("Could not read CSV. Make sure it is a valid CSV file.")
+        return None
 
     required_raw = {
         "country","year","lev","noncore","ltd","hpnom","cpi",
         "tloans","ltrate","stir","money","gdp","ca"
     }
-    missing = sorted(list(required_raw - set(user_df.columns)))
-    if missing:
+    missing_cols = sorted(list(required_raw - set(user_df.columns)))
+    if missing_cols:
         st.sidebar.error(
-            "Missing columns (showing up to 12): " + ", ".join(missing[:12]) +
-            ("..." if len(missing) > 12 else "")
+            "Missing columns (showing up to 12): " + ", ".join(missing_cols[:12]) +
+            ("..." if len(missing_cols) > 12 else "")
         )
         return None
 
-    df_feat, base_feats = engineer_features(user_df)
-    df_clean = clean_data(df_feat, base_feats)
+    # Feature engineering (sovereign spread uses JST USA map)
+    df_feat, base_feats_upload = engineer_features(user_df, us_ltrate_map=us_ltrate_map)
+    df_clean = clean_data(df_feat, base_feats_upload)
 
-    X_u = df_clean[all_features].copy()
+    # Extra hardening: ensure any remaining NaNs are filled with training medians (then 0)
+    for col in base_feats_upload:
+        df_clean[col] = df_clean[col].replace([np.inf, -np.inf], np.nan)
 
+        fill_val = base_feature_medians.get(col, np.nan)
+        if pd.isna(fill_val):
+            fill_val = 0.0
+
+        df_clean[col] = df_clean[col].fillna(fill_val)
+
+    # Ensure missing flags exist
+    for col in base_feats_upload:
+        miss_col = f"{col}_missing"
+        if miss_col not in df_clean.columns:
+            df_clean[miss_col] = 0
+
+    # Build model matrix in same order as training
+    try:
+        X_u = df_clean[all_features].copy()
+    except KeyError:
+        # If some flags missing, create them
+        for f in all_features:
+            if f not in df_clean.columns:
+                df_clean[f] = 0
+        X_u = df_clean[all_features].copy()
+
+    # Scale continuous only
     X_u_cont = scaler.transform(X_u[base_features])
     X_u_scaled = np.hstack([X_u_cont, X_u[missing_features].values])
 
-    probs = selected_model.predict_proba(X_u_scaled)[:, 1]
+    # Final safety check
+    if not np.isfinite(X_u_scaled).all():
+        bad_mask = ~np.isfinite(X_u_scaled)
+        st.sidebar.error("Upload data still contains NaN/Inf after cleaning (cannot predict).")
+        st.sidebar.info("Common cause: a column is entirely missing for that country/time period.")
+        # Show which features are problematic
+        bad_cols = set()
+        for j in range(X_u_scaled.shape[1]):
+            if bad_mask[:, j].any():
+                bad_cols.add(all_features[j] if j < len(all_features) else f"col_{j}")
+        st.sidebar.write("Problematic features:", sorted(list(bad_cols))[:20])
+        return None
+
+    # Predict safely
+    try:
+        probs = selected_model.predict_proba(X_u_scaled)[:, 1]
+    except Exception:
+        st.sidebar.error("Prediction failed. Try selecting a different model.")
+        return None
+
     preds = (probs >= threshold).astype(int)
 
     out = df_clean[["country", "year"]].copy()
@@ -461,16 +540,11 @@ def run_upload_predict_sidebar(selected_model, scaler, threshold, base_features,
     st.sidebar.success(f"{int(preds.sum())} high-risk rows ({100 * preds.mean():.1f}%)")
     return out
 
-
 # ======================================================================
-# 5) SHAP PIE (cached per model + sample size)
+# 5) SHAP PIE (cached)
 # ======================================================================
 
 def get_shap_pie_data(model_key: str, selected_model, Xs_test: np.ndarray, feature_names: list, sample_n: int):
-    """
-    Returns df: Feature, Share using mean(|SHAP|) across sampled test rows.
-    Cached in st.session_state to avoid recomputation on reruns.
-    """
     if "shap_pie_cache" not in st.session_state:
         st.session_state["shap_pie_cache"] = {}
 
@@ -498,7 +572,6 @@ def get_shap_pie_data(model_key: str, selected_model, Xs_test: np.ndarray, featu
     st.session_state["shap_pie_cache"][cache_key] = df_pie
     return df_pie
 
-
 # ======================================================================
 # 6) LOAD EVERYTHING
 # ======================================================================
@@ -522,6 +595,8 @@ Xs_test = bundle["Xs_test"]
 y_test = bundle["y_test"]
 X_full_scaled = bundle["X_full_scaled"]
 test_probs_by_model = bundle["test_probs_by_model"]
+us_ltrate_map = bundle["us_ltrate_map"]
+base_feature_medians = bundle["base_feature_medians"]
 
 macro_df = get_jst_macro_series(str(JST_XLSX))
 
@@ -575,14 +650,16 @@ show_crisis_years = st.sidebar.checkbox("Show crisis years list", value=True)
 st.sidebar.subheader("🧠 SHAP Pie (first page)")
 shap_pie_sample_n = st.sidebar.slider("SHAP sample size", 50, 400, 150, 25)
 
-# Upload & predict in sidebar
+# Upload & predict in sidebar (FIXED)
 uploaded_preds = run_upload_predict_sidebar(
     selected_model=selected_model,
     scaler=scaler,
     threshold=threshold,
     base_features=base_features,
     missing_features=missing_features,
-    all_features=all_features
+    all_features=all_features,
+    us_ltrate_map=us_ltrate_map,
+    base_feature_medians=base_feature_medians,
 )
 
 # ======================================================================
@@ -611,14 +688,13 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
 ])
 
 # -----------------------------------------------------------------------------
-# TAB 1: Crisis Risk + JST GDP + Real House Prices + SHAP pie + explanation
+# TAB 1
 with tab1:
     st.header("Crisis risk over time", divider="gray")
 
     if risk_df.empty:
         st.warning("No data for the selected filters.")
     else:
-        # RGB-controlled chart
         altair_line_chart(
             risk_df,
             x_col="year",
@@ -633,12 +709,11 @@ with tab1:
         latest = risk_df[risk_df["year"] == to_year]
         cols = st.columns(3)
 
-        # ✅ Summary in PERCENTAGE
         for i, c in enumerate(risk_countries):
             with cols[i % 3]:
                 val = latest[latest["country"] == c]["crisis_prob"].mean()
                 if pd.isna(val):
-                    st.metric(label=f"{c} risk", value="n/a")
+                    st.metric(label=f"{c} crisis risk", value="n/a")
                 else:
                     val_pct = val * 100
                     thr_pct = threshold * 100
@@ -661,7 +736,7 @@ with tab1:
 
         left, right = st.columns(2)
 
-        # --- LEFT: GDP & House prices from JSTdatasetR6.xlsx (RGB-controlled) ---
+        # LEFT: GDP & Real house prices
         with left:
             st.markdown("### 🌍 GDP (JST variable)")
             macro_filtered = macro_df[
@@ -678,7 +753,6 @@ with tab1:
                     color_col="country",
                     title="GDP (JST variable)"
                 )
-                st.caption("This uses the **JST `gdp` variable** (check JST codebook for exact definition/units).")
             else:
                 st.warning("Column `gdp` not found in JSTdatasetR6.xlsx")
 
@@ -690,17 +764,17 @@ with tab1:
                     x_col="year",
                     y_col="house_price_real",
                     color_col="country",
-                    title="Real House Prices (hpnom / cpi)"
+                    title="Real house prices (hpnom / cpi)"
                 )
             else:
                 st.info("House price columns not available to compute real house prices.")
 
-        # --- RIGHT: SHAP pie (visibility fixed) + explanation under pie ---
+        # RIGHT: SHAP pie + explanation
         with right:
             st.markdown("### 🧠 SHAP Explainability")
             st.caption("Pie uses **mean(|SHAP|)** across sampled test rows (share of total influence).")
 
-            top_k = 8  # fewer slices => clearer pie
+            top_k = 8
             try:
                 shap_pie_df = get_shap_pie_data(
                     model_key=model_choice,
@@ -759,15 +833,14 @@ with tab1:
                     """
 **What SHAP values represent**
 
-- SHAP (SHapley Additive exPlanations) decomposes a model prediction into **feature contributions** relative to a baseline.  
-- **Positive SHAP** → pushes predicted crisis risk **up**.  
-- **Negative SHAP** → pushes predicted crisis risk **down**.  
-- Larger **|SHAP|** → stronger influence.
+- SHAP decomposes a model prediction into **feature contributions** around a baseline.  
+- **Positive SHAP** pushes predicted crisis risk **up**; **negative SHAP** pushes it **down**.  
+- Larger **|SHAP|** means **stronger influence**.
 
 **What this pie chart shows**
 
-This pie chart uses **mean(|SHAP|)** across many test observations to represent **global importance** (share of total influence).  
-It shows *how much* a feature matters overall, not whether it increases/decreases risk on average.
+This pie uses **mean(|SHAP|)** over many observations, so it is **global importance** (share of total influence).  
+It shows *how much* a feature matters overall, not the direction of its effect.
 """
                 )
 
@@ -784,7 +857,7 @@ It shows *how much* a feature matters overall, not whether it increases/decrease
                 )
 
 # -----------------------------------------------------------------------------
-# TAB 2: Model Results
+# TAB 2
 with tab2:
     st.header("Model comparison (validation)", divider="gray")
     st.dataframe(results_df, use_container_width=True)
@@ -815,7 +888,7 @@ with tab2:
     st.dataframe(cm_df, use_container_width=True)
 
 # -----------------------------------------------------------------------------
-# TAB 3: Uploaded Predictions
+# TAB 3
 with tab3:
     st.header("Predictions from uploaded CSV", divider="gray")
 
@@ -826,8 +899,7 @@ with tab3:
 
         st.write("")
         st.subheader("Uploaded risk over time", divider="gray")
-
-        # Use RGB mapping if uploaded has same country labels; otherwise unknowns are grey
+        # If uploaded country isn't USA/UK/Canada it will appear grey (by design)
         altair_line_chart(
             uploaded_preds.sort_values(["country", "year"]),
             x_col="year",
@@ -845,7 +917,7 @@ with tab3:
         )
 
 # -----------------------------------------------------------------------------
-# TAB 4: SHAP (detailed)
+# TAB 4
 with tab4:
     st.header("SHAP explainability", divider="gray")
 
@@ -863,7 +935,7 @@ For a single observation:
 - **Negative SHAP** → pushes prediction **away from crisis (lower risk)**
 - Larger **|SHAP|** → stronger effect
 
-**Note:** The pie chart uses **mean(|SHAP|)** (importance share), which shows *how much* a feature matters overall, not direction.
+**Note:** The pie chart uses **mean absolute SHAP** (importance share), which shows *how much* a feature matters overall, not direction.
 """
     )
 
@@ -888,7 +960,7 @@ For a single observation:
             st.pyplot(plt.gcf(), clear_figure=True)
 
 # -----------------------------------------------------------------------------
-# TAB 5: Data Explorer
+# TAB 5
 with tab5:
     st.header("Data explorer (processed)", divider="gray")
     st.caption("Cleaned + engineered dataset used for modelling (includes missing flags + target).")
