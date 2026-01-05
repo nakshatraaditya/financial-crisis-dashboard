@@ -1,15 +1,15 @@
 # ======================================================================
 #  FINANCIAL CRISIS EARLY WARNING SYSTEM – STREAMLIT DASHBOARD
-#  Multi-model pipeline (your dissertation version):
+#  Uses YOUR multi-model pipeline:
 #   - Missing-value flags
 #   - Proper scaling (continuous only)
 #   - Multi-model validation + best model selection
 #   - SHAP explainability
-#  Updates requested:
-#   ✅ GDP graph for JST countries on FIRST PAGE (Crisis Risk tab)
-#   ✅ SHAP pie chart on FIRST PAGE (Crisis Risk tab)
+#  Requested updates:
+#   ✅ Interactive SHAP pie chart on FIRST page (Plotly)
+#   ✅ GDP chart on FIRST page defaults to USA/UK/Canada when NO upload
 #  Fix included:
-#   ✅ results_df is Arrow-safe (no sklearn objects)
+#   ✅ results_df Arrow-safe (no sklearn objects inside dataframe)
 # ======================================================================
 
 import streamlit as st
@@ -17,7 +17,9 @@ import pandas as pd
 import numpy as np
 import math
 from pathlib import Path
+
 import matplotlib.pyplot as plt
+import plotly.express as px
 
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
@@ -56,19 +58,16 @@ GDP_CSV  = APP_DIR / "data" / "gdp_data.csv"
 """
 # 📉 Financial Crisis Early Warning System (EWS)
 
-This dashboard implements your **multi-model dissertation pipeline**:
-- Missing-value flags + causal imputation
-- Proper scaling (continuous only)
-- Validation-based model selection + threshold optimization
-- SHAP explainability
-- Interactive risk timeline (Streamlit-native `line_chart`)
-- GDP context (World Bank template style)
-- Upload & Predict moved to the **sidebar**
+- Missing-value flags + causal imputation  
+- Proper scaling (continuous only)  
+- Validation-based model selection + threshold optimization  
+- SHAP explainability (interactive pie on first page)  
+- GDP context (defaults to USA/UK/Canada unless user upload provides countries)  
 """
 st.write("")
 
 # -----------------------------------------------------------------------------
-# Optional: cache reset button
+# Optional cache reset button
 with st.sidebar:
     if st.button("Clear cache & rerun"):
         st.cache_data.clear()
@@ -272,7 +271,9 @@ def train_pipeline(jst_path: str):
     df_raw = load_data(jst_path)
     df_feat, base_features = engineer_features(df_raw)
     df_clean = clean_data(df_feat, base_features)
-    df_target = create_target(df_clean).reset_index(drop=True)  # reset index for safe alignment
+
+    # Important: reset index so X_full_scaled aligns safely by row position
+    df_target = create_target(df_clean).reset_index(drop=True)
 
     missing_features = [f"{f}_missing" for f in base_features]
     all_features = base_features + missing_features
@@ -320,7 +321,7 @@ def train_pipeline(jst_path: str):
     for name, clf in fitted_models.items():
         test_probs_by_model[name] = clf.predict_proba(Xs_test)[:, 1]
 
-    # Full scaled matrix aligned to df_target (since we reset_index above)
+    # Full scaled matrix aligned to df_target (index-reset = safe by row position)
     X_full = df_target[all_features]
     X_full_cont = scaler.transform(X_full[base_features])
     X_full_scaled = np.hstack([X_full_cont, X_full[missing_features].values])
@@ -363,7 +364,10 @@ def run_upload_predict_sidebar(selected_model, scaler, threshold, base_features,
     }
     missing = sorted(list(required_raw - set(user_df.columns)))
     if missing:
-        st.sidebar.error("Missing columns (showing up to 12): " + ", ".join(missing[:12]) + ("..." if len(missing) > 12 else ""))
+        st.sidebar.error(
+            "Missing columns (showing up to 12): " + ", ".join(missing[:12]) +
+            ("..." if len(missing) > 12 else "")
+        )
         return None
 
     df_feat, base_feats = engineer_features(user_df)
@@ -386,38 +390,41 @@ def run_upload_predict_sidebar(selected_model, scaler, threshold, base_features,
 
 
 # ======================================================================
-# 5) SHAP PIE: cached per model (fast reuse)
+# 5) SHAP PIE (cached per model + sample size in session_state)
 # ======================================================================
 
-def get_shap_pie_data(model_name: str, selected_model, Xs_test: np.ndarray, feature_names: list, sample_n: int):
+def get_shap_pie_data(model_key: str, selected_model, Xs_test: np.ndarray, feature_names: list, sample_n: int):
     """
-    Returns (labels, shares) using mean(|SHAP|) across sampled rows.
+    Returns a dataframe with Feature + Share for mean(|SHAP|) across sampled test rows.
     Cached in st.session_state to avoid recomputation on reruns.
     """
     if "shap_pie_cache" not in st.session_state:
         st.session_state["shap_pie_cache"] = {}
 
-    cache_key = (model_name, int(sample_n))
+    cache_key = (model_key, int(sample_n))
     if cache_key in st.session_state["shap_pie_cache"]:
         return st.session_state["shap_pie_cache"][cache_key]
 
     X_test_shap = pd.DataFrame(Xs_test, columns=feature_names)
     Xsamp = X_test_shap.sample(n=min(sample_n, len(X_test_shap)), random_state=42)
 
-    # SHAP
     explainer = shap.Explainer(selected_model, X_test_shap)
     shap_vals = explainer(Xsamp)
 
     values = shap_vals.values
+    # Some explainers return (n, p, 2) for binary; use positive class
     if values.ndim == 3:
-        values = values[:, :, 1]  # positive class
+        values = values[:, :, 1]
 
     mean_abs = np.mean(np.abs(values), axis=0)
     total = float(mean_abs.sum()) + 1e-12
     shares = mean_abs / total
 
-    st.session_state["shap_pie_cache"][cache_key] = (feature_names, shares)
-    return feature_names, shares
+    df_pie = pd.DataFrame({"Feature": feature_names, "Share": shares})
+    df_pie = df_pie.sort_values("Share", ascending=False).reset_index(drop=True)
+
+    st.session_state["shap_pie_cache"][cache_key] = df_pie
+    return df_pie
 
 
 # ======================================================================
@@ -447,7 +454,7 @@ test_probs_by_model = bundle["test_probs_by_model"]
 # GDP optional
 gdp_df = get_gdp_data(GDP_CSV) if GDP_CSV.exists() else None
 
-# Mapping JST -> World Bank codes for GDP
+# Mapping JST -> World Bank codes (GDP CSV uses ISO3)
 GDP_CODE_MAP = {
     "USA": "USA",
     "UK": "GBR",
@@ -524,7 +531,7 @@ risk_df = df_target[
     (df_target["year"] <= to_year)
 ].copy()
 
-# Since df_target is reset_index(drop=True), this is safe:
+# df_target index is 0..n-1 (reset), so row-position selection is safe
 risk_scaled = X_full_scaled[risk_df.index.to_numpy()]
 risk_df["crisis_prob"] = selected_model.predict_proba(risk_scaled)[:, 1]
 
@@ -542,7 +549,7 @@ tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
 ])
 
 # -----------------------------------------------------------------------------
-# TAB 1: Crisis Risk + (NEW) GDP chart for JST countries + (NEW) SHAP pie chart
+# TAB 1: Crisis Risk + Interactive SHAP pie + GDP default USA/UK/Canada if no upload
 with tab1:
     st.header("Crisis risk over time", divider="gray")
 
@@ -583,21 +590,31 @@ with tab1:
                     st.write(f"**{c}:** " + (", ".join(map(str, years)) if years else "none"))
 
         st.write("")
-        st.subheader("Macroeconomic context + Explainability (first page)", divider="gray")
+        st.subheader("Context + Explainability (first page)", divider="gray")
 
         left, right = st.columns(2)
 
-        # --- LEFT: GDP chart for JST countries ---
+        # --- LEFT: GDP chart (defaults to USA/UK/Canada if no upload) ---
         with left:
-            st.markdown("### 🌍 GDP for selected JST countries")
-
+            st.markdown("### 🌍 GDP (World Bank)")
             if gdp_df is None:
                 st.warning("GDP file not found. Add /data/gdp_data.csv to enable GDP charts.")
             else:
-                # Map JST countries -> GDP codes
-                gdp_codes = [GDP_CODE_MAP[c] for c in risk_countries if c in GDP_CODE_MAP]
+                # Default GDP codes if user has not uploaded any data
+                if uploaded_preds is None:
+                    gdp_codes = ["USA", "GBR", "CAN"]
+                else:
+                    uploaded_countries = uploaded_preds["country"].dropna().unique().tolist()
+                    mapped = []
+                    for c in uploaded_countries:
+                        c = str(c)
+                        if c in GDP_CODE_MAP:
+                            mapped.append(GDP_CODE_MAP[c])
+                        elif len(c) == 3:
+                            mapped.append(c.upper())
+                    gdp_codes = sorted(list(set(mapped))) if mapped else ["USA", "GBR", "CAN"]
 
-                # Clip years to GDP range
+                # Clip year range to GDP dataset range
                 g_from = max(1960, int(from_year))
                 g_to = min(2022, int(to_year))
 
@@ -607,11 +624,10 @@ with tab1:
                     (gdp_df["Year"] <= g_to)
                 ].copy()
 
-                # Use billions for readability
                 gdp_filtered["GDP_B"] = gdp_filtered["GDP"] / 1e9
 
                 if gdp_filtered.empty:
-                    st.info("No GDP data for the selected countries/year window.")
+                    st.info("No GDP data for selected countries/year window.")
                 else:
                     st.line_chart(
                         gdp_filtered,
@@ -619,53 +635,52 @@ with tab1:
                         y="GDP_B",
                         color="Country Code"
                     )
-                    st.caption("GDP shown in **billions** (World Bank codes: USA, GBR, CAN).")
+                    st.caption("GDP shown in **billions** (default: USA/GBR/CAN).")
 
-        # --- RIGHT: SHAP Pie chart ---
+        # --- RIGHT: SHAP Pie chart (interactive Plotly) ---
         with right:
-            st.markdown("### 🧠 SHAP pie (global feature impact share)")
+            st.markdown("### 🧠 SHAP pie (interactive)")
             st.caption("Pie uses **mean(|SHAP|)** across sampled test rows (share of total influence).")
 
+            top_k = 10
             try:
-                feature_names, shares = get_shap_pie_data(
-                    model_name=model_choice,
+                shap_pie_df = get_shap_pie_data(
+                    model_key=model_choice,
                     selected_model=selected_model,
                     Xs_test=Xs_test,
                     feature_names=all_features,
                     sample_n=shap_pie_sample_n
                 )
 
-                # show top 10 + Other
-                top_k = 10
-                order = np.argsort(shares)[::-1]
-                top_idx = order[:top_k]
-                other_idx = order[top_k:]
+                # Top-k + Other
+                top = shap_pie_df.head(top_k).copy()
+                other_share = float(shap_pie_df["Share"].iloc[top_k:].sum()) if len(shap_pie_df) > top_k else 0.0
+                if other_share > 0:
+                    top = pd.concat(
+                        [top, pd.DataFrame([{"Feature": "Other", "Share": other_share}])],
+                        ignore_index=True
+                    )
 
-                labels = [feature_names[i] for i in top_idx]
-                sizes = [float(shares[i]) for i in top_idx]
+                top["Share_%"] = top["Share"] * 100
 
-                if len(other_idx) > 0:
-                    labels.append("Other")
-                    sizes.append(float(np.sum(shares[other_idx])))
-
-                plt.figure()
-                plt.pie(
-                    sizes,
-                    labels=labels,
-                    autopct=lambda p: f"{p:.1f}%" if p >= 4 else ""
+                fig = px.pie(
+                    top,
+                    names="Feature",
+                    values="Share",
+                    hover_data=["Share_%"],
+                    title="SHAP Feature Impact Share (mean |SHAP|)"
                 )
-                plt.title("SHAP Feature Impact Share")
-                st.pyplot(plt.gcf(), clear_figure=True)
+                fig.update_traces(textposition="inside", textinfo="percent+label")
+                st.plotly_chart(fig, use_container_width=True)
 
                 st.caption(
-                    "Interpretation: Larger slice = feature has greater overall influence on predicted crisis risk. "
-                    "Pie does not show direction (risk ↑ vs ↓). See SHAP tab for more detail."
+                    "Bigger slice = feature has larger overall influence on predicted crisis risk. "
+                    "Pie shows magnitude share, not direction (↑/↓)."
                 )
-
-            except Exception as e:
+            except Exception:
                 st.warning(
-                    "SHAP pie could not be computed for the selected model. "
-                    "Try Gradient Boosting or Random Forest, or reduce SHAP sample size."
+                    "SHAP pie could not be computed for this model. "
+                    "Try Gradient Boosting / Random Forest or reduce SHAP sample size."
                 )
 
 # -----------------------------------------------------------------------------
@@ -727,21 +742,26 @@ with tab3:
         )
 
 # -----------------------------------------------------------------------------
-# TAB 4: SHAP tab (detailed)
+# TAB 4: SHAP (detailed explanation + standard summary plot)
 with tab4:
     st.header("SHAP explainability", divider="gray")
 
     st.markdown(
         """
 **What are SHAP values?**  
-SHAP (SHapley Additive exPlanations) explains a prediction by splitting it into feature contributions.
+SHAP (SHapley Additive exPlanations) explains model predictions by assigning each feature a contribution.
+
+For a single observation:
+
+**prediction = base value + sum(feature contributions)**
 
 **Interpretation**
 - **Positive SHAP value** → pushes the prediction **towards crisis (higher risk)**
 - **Negative SHAP value** → pushes the prediction **away from crisis (lower risk)**
-- Larger **|SHAP|** → stronger influence
+- Larger **|SHAP|** → stronger influence on the prediction
 
-**Note:** The pie chart shows **mean absolute SHAP** (importance share), not direction.
+**Note:** The pie chart uses **mean absolute SHAP** (global importance share), so it shows *how much* a feature matters overall,
+but not whether it pushes risk up or down on average.
 """
     )
 
@@ -766,7 +786,7 @@ SHAP (SHapley Additive exPlanations) explains a prediction by splitting it into 
             st.pyplot(plt.gcf(), clear_figure=True)
 
 # -----------------------------------------------------------------------------
-# TAB 5: GDP (template style)
+# TAB 5: GDP (full template-style explorer)
 with tab5:
     st.header("🌍 GDP dashboard", divider="gray")
 
@@ -776,7 +796,7 @@ with tab5:
             "Add the World Bank template file to /data/gdp_data.csv to enable this tab."
         )
     else:
-        st.caption("Streamlit-template style (slider + multiselect + line_chart + metrics).")
+        st.caption("Template-style (slider + multiselect + line_chart + metrics).")
 
         gdp_min = int(gdp_df["Year"].min())
         gdp_max = int(gdp_df["Year"].max())
@@ -794,7 +814,7 @@ with tab5:
         g_selected = st.multiselect(
             "Which countries would you like to view?",
             g_countries,
-            default=["DEU", "FRA", "GBR", "USA", "CAN", "JPN"],
+            default=["USA", "GBR", "CAN"],
             key="gdp_country_selector"
         )
 
@@ -817,43 +837,6 @@ with tab5:
             y="GDP_B",
             color="Country Code",
         )
-
-        st.write("")
-        st.subheader(f"GDP in {g_to_year}", divider="gray")
-
-        first_year = gdp_df[gdp_df["Year"] == g_from_year]
-        last_year  = gdp_df[gdp_df["Year"] == g_to_year]
-
-        cols = st.columns(4)
-        for i, country in enumerate(g_selected):
-            col = cols[i % len(cols)]
-            with col:
-                try:
-                    first_vals = first_year[first_year["Country Code"] == country]["GDP"]
-                    last_vals  = last_year[last_year["Country Code"] == country]["GDP"]
-
-                    if first_vals.empty or last_vals.empty:
-                        st.metric(label=f"{country} GDP", value="n/a")
-                        continue
-
-                    first_gdp = float(first_vals.iloc[0]) / 1e9
-                    last_gdp  = float(last_vals.iloc[0]) / 1e9
-
-                    if math.isnan(first_gdp) or first_gdp == 0:
-                        growth = "n/a"
-                        delta_color = "off"
-                    else:
-                        growth = f"{last_gdp / first_gdp:,.2f}x"
-                        delta_color = "normal"
-
-                    st.metric(
-                        label=f"{country} GDP",
-                        value=f"{last_gdp:,.0f}B",
-                        delta=growth,
-                        delta_color=delta_color,
-                    )
-                except Exception:
-                    st.metric(label=f"{country} GDP", value="n/a")
 
 # -----------------------------------------------------------------------------
 # TAB 6: Data Explorer
