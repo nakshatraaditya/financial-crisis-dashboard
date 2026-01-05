@@ -1,23 +1,21 @@
 # ======================================================================
 #  FINANCIAL CRISIS EARLY WARNING SYSTEM – STREAMLIT DASHBOARD (FULL)
 #
-#  INCLUDED (your requests):
-#   ✅ Tab 1 switches to uploaded country when you upload (optional toggle)
-#   ✅ Crisis risk chart:
-#        - Training (USA/UK/Canada): shaded crisis bands (crisisJST)
-#        - Uploaded: WHITE vertical crisis lines (requires crisisJST in upload)
-#   ✅ Tab 1 ALSO shows (for BOTH default + uploaded):
-#        - GDP line chart (from JST for default; from uploaded CSV for uploaded)
-#        - Real house price chart (hpnom/cpi)
-#        - SHAP interactive pie + explanation directly under it
-#   ✅ RGB-consistent country colors (Altair) across charts
-#   ✅ Crisis summary displayed as percentage + delta vs threshold
-#   ✅ Upload crash fix (Spain etc.): sovereign spread uses USA ltrate from JST + robust NaN handling
-#   ✅ Arrow-safe results table (no sklearn objects in dataframe)
+#  VERSION: Upload REMOVED (no upload tab, no sidebar uploader)
 #
-#  Notes:
-#   - Plotly is OPTIONAL. If not installed, pie falls back to matplotlib (non-interactive).
-#   - Altair is OPTIONAL. If not installed, charts fall back to st.line_chart (no custom colors/lines).
+#  INCLUDED:
+#   ✅ Robust multi-model pipeline (missing flags + proper scaling)
+#   ✅ Works on JST advanced economies subset (you can change country list)
+#   ✅ Interactive RGB country selection across charts (Altair if available)
+#   ✅ Crisis Risk tab with crisis overlays (bands)
+#   ✅ GDP + Real House Price charts from JST (gdp, hpnom/cpi)
+#   ✅ SHAP interactive pie + explanation directly under it (Plotly if available)
+#   ✅ Model Results tab with validation comparison + test metrics + confusion matrix
+#   ✅ Data Explorer tab
+#
+#  NOTES:
+#   - If Plotly isn't installed on Streamlit Cloud, pie will fallback to Matplotlib.
+#   - If Altair isn't installed, charts fallback to st.line_chart (no overlays/colors).
 # ======================================================================
 
 import streamlit as st
@@ -26,20 +24,6 @@ import numpy as np
 import math
 from pathlib import Path
 import matplotlib.pyplot as plt
-
-# Optional Plotly for interactive pie
-try:
-    import plotly.express as px
-    PLOTLY_OK = True
-except Exception:
-    PLOTLY_OK = False
-
-# Optional Altair for interactive RGB charts + crisis overlays
-try:
-    import altair as alt
-    ALTAIR_OK = True
-except Exception:
-    ALTAIR_OK = False
 
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
@@ -60,6 +44,20 @@ import shap
 import warnings
 warnings.filterwarnings("ignore")
 
+# Optional Plotly for interactive pie
+try:
+    import plotly.express as px
+    PLOTLY_OK = True
+except Exception:
+    PLOTLY_OK = False
+
+# Optional Altair for interactive RGB charts + crisis overlays
+try:
+    import altair as alt
+    ALTAIR_OK = True
+except Exception:
+    ALTAIR_OK = False
+
 # -----------------------------------------------------------------------------
 # STREAMLIT CONFIG
 st.set_page_config(page_title="Financial Crisis EWS Dashboard", page_icon="📉", layout="wide")
@@ -68,12 +66,14 @@ APP_DIR = Path(__file__).parent
 JST_XLSX = APP_DIR / "JSTdatasetR6.xlsx"
 
 # -----------------------------------------------------------------------------
-# RGB color settings
-BASE_COUNTRY_ORDER = ["USA", "UK", "Canada"]
+# RGB color settings (fixed for key countries, deterministic for others)
+BASE_COUNTRY_ORDER = ["USA", "UK", "Canada", "Australia", "Ireland"]
 BASE_COUNTRY_RGB = {
     "USA": "rgb(255, 99, 71)",      # tomato
     "UK": "rgb(100, 149, 237)",     # cornflower blue
     "Canada": "rgb(60, 179, 113)",  # medium sea green
+    "Australia": "rgb(255, 165, 0)",# orange
+    "Ireland": "rgb(138, 43, 226)", # blueviolet
 }
 
 # -----------------------------------------------------------------------------
@@ -81,7 +81,7 @@ BASE_COUNTRY_RGB = {
 st.title("📉 Financial Crisis Early Warning System (EWS)")
 st.caption(
     "Multi-model pipeline (missing flags + proper scaling + validation selection) "
-    "with risk timeline, GDP/house-price context, and SHAP explainability."
+    "with risk timeline, macro context (GDP, house prices), and SHAP explainability."
 )
 st.write("")
 
@@ -98,7 +98,7 @@ with st.sidebar:
 # ======================================================================
 
 def stable_rgb(name: str) -> str:
-    """Deterministic RGB for any unseen country label (so Spain etc. get a stable color)."""
+    """Deterministic RGB for any unseen country label."""
     h = abs(hash(name))
     r = 60 + (h % 140)
     g = 60 + ((h // 140) % 140)
@@ -175,29 +175,7 @@ def line_chart_training_with_bands(df, x_col, y_col, color_col, title, crisis_df
     chart = alt.layer(*layers).properties(height=320, title=title).interactive()
     st.altair_chart(chart, use_container_width=True)
 
-def line_chart_uploaded_with_white_lines(df, x_col, y_col, color_col, title, crisis_years):
-    """Uploaded view: WHITE vertical lines at crisis years (single set across all uploaded countries)."""
-    if df.empty:
-        st.info("No data to plot.")
-        return
-    if not ALTAIR_OK:
-        st.line_chart(df, x=x_col, y=y_col, color=color_col)
-        return
-
-    line, _, _ = _altair_base_line(df, x_col, y_col, color_col)
-    layers = [line]
-
-    crisis_years = sorted(set([int(y) for y in (crisis_years or [])]))
-    if crisis_years:
-        rule_df = pd.DataFrame({"year": crisis_years})
-        rules = alt.Chart(rule_df).mark_rule(color="white", strokeWidth=2, opacity=0.95).encode(x="year:Q")
-        layers.append(rules)
-
-    chart = alt.layer(*layers).properties(height=320, title=title).interactive()
-    st.altair_chart(chart, use_container_width=True)
-
 def line_chart_simple(df, x_col, y_col, color_col, title):
-    """Fallback generic interactive chart (no crisis overlays)."""
     if df.empty:
         st.info("No data to plot.")
         return
@@ -208,13 +186,14 @@ def line_chart_simple(df, x_col, y_col, color_col, title):
     st.altair_chart(line.properties(height=320, title=title).interactive(), use_container_width=True)
 
 # ======================================================================
-# JST Macro series (GDP + House prices) for training countries
+# JST Macro series (GDP + House prices)
 # ======================================================================
 
 @st.cache_data
-def get_jst_macro_series(jst_path: str) -> pd.DataFrame:
+def get_jst_macro_series(jst_path: str, countries: list[str]) -> pd.DataFrame:
     df = pd.read_excel(jst_path)
-    df = df[df["country"].isin(["USA", "UK", "Canada"])].copy()
+    df["country"] = df["country"].astype(str).str.strip()
+    df = df[df["country"].isin(countries)].copy()
     df = df.sort_values(["country", "year"])
 
     cols = ["country", "year", "gdp", "hpnom", "cpi"]
@@ -229,19 +208,15 @@ def get_jst_macro_series(jst_path: str) -> pd.DataFrame:
 # Your pipeline functions
 # ======================================================================
 
-def load_data(file="JSTdatasetR6.xlsx"):
+def load_data(file: str, countries: list[str]):
     df = pd.read_excel(file)
-    df = df[df["country"].isin(["USA", "UK", "Canada"])].copy()
+    df["country"] = df["country"].astype(str).str.strip()
+    df = df[df["country"].isin(countries)].copy()
     df = df.sort_values(["country", "year"])
     return df
 
-def engineer_features(df, us_ltrate_map: dict | None = None):
+def engineer_features(df):
     df = df.copy()
-
-    if "crisisJST" not in df.columns:
-        df["crisisJST"] = 0
-
-    df["country"] = df["country"].astype(str).str.strip()
 
     df["leverage_risk"] = 1 / (df["lev"] + 0.01)
 
@@ -265,22 +240,8 @@ def engineer_features(df, us_ltrate_map: dict | None = None):
     df["real_credit"]   = df["tloans"] / (df["cpi"] + 1e-9)
     df["credit_growth"] = df.groupby("country")["real_credit"].pct_change()
 
+    # Universal term spread
     df["yield_curve"] = df["ltrate"] - df["stir"]
-
-    # Sovereign spread
-    if us_ltrate_map is None:
-        if "USA" in set(df["country"].unique()):
-            us_ltrate_map = (
-                df[df["country"] == "USA"]
-                .drop_duplicates("year")
-                .set_index("year")["ltrate"]
-                .to_dict()
-            )
-        else:
-            us_ltrate_map = {}
-
-    df["us_ltrate"] = df["year"].map(us_ltrate_map) if isinstance(us_ltrate_map, dict) else np.nan
-    df["sovereign_spread"] = df["ltrate"] - df["us_ltrate"]
 
     df["money_gdp"] = df["money"] / (df["gdp"] + 1e-9)
     df["money_expansion"] = df.groupby("country")["money_gdp"].pct_change()
@@ -289,7 +250,7 @@ def engineer_features(df, us_ltrate_map: dict | None = None):
 
     base_features = [
         "housing_bubble", "credit_growth", "banking_fragility",
-        "sovereign_spread", "yield_curve", "money_expansion", "ca_gdp"
+        "yield_curve", "money_expansion", "ca_gdp"
     ]
 
     df = df[["country", "year", "crisisJST"] + base_features].copy()
@@ -298,14 +259,15 @@ def engineer_features(df, us_ltrate_map: dict | None = None):
 
 def clean_data(df, base_features):
     df = df.copy()
-    df = df[~df["year"].between(1914, 1918)]
-    df = df[~df["year"].between(1939, 1945)]
-
     for col in base_features:
         df[f"{col}_missing"] = df[col].isna().astype(int)
 
-    df[base_features] = df.groupby("country")[base_features].transform(lambda x: x.ffill(limit=3).bfill(limit=3))
-    df[base_features] = df.groupby("country")[base_features].transform(lambda x: x.fillna(x.median()))
+    df[base_features] = df.groupby("country")[base_features].transform(
+        lambda x: x.ffill(limit=3).bfill(limit=3)
+    )
+    df[base_features] = df.groupby("country")[base_features].transform(
+        lambda x: x.fillna(x.median())
+    )
     return df
 
 def create_target(df):
@@ -324,18 +286,24 @@ def build_model_set():
     return {
         "Logistic Regression": LogisticRegression(max_iter=5000),
         "Random Forest": RandomForestClassifier(
-            n_estimators=600, max_depth=4, min_samples_leaf=5,
-            class_weight="balanced_subsample", random_state=42
+            n_estimators=600, max_depth=4,
+            min_samples_leaf=5,
+            class_weight="balanced_subsample",
+            random_state=42
         ),
         "Gradient Boosting": GradientBoostingClassifier(
-            n_estimators=400, learning_rate=0.01, max_depth=3, random_state=42
+            n_estimators=400,
+            learning_rate=0.01,
+            max_depth=3,
+            random_state=42
         ),
         "SVM (RBF)": SVC(kernel="rbf", probability=True, C=2.0, class_weight="balanced"),
-        "Neural Network": MLPClassifier(hidden_layer_sizes=(32, 16), max_iter=2000, random_state=42),
+        "Neural Network": MLPClassifier(hidden_layer_sizes=(32, 16), max_iter=2000, random_state=42)
     }
 
 def evaluate_model(name, model, X_tr, y_tr, X_val, y_val):
     weights = np.where(y_tr == 1, 10, 1)
+
     if name == "Neural Network":
         model.fit(X_tr, y_tr)
     else:
@@ -367,24 +335,17 @@ def evaluate_model(name, model, X_tr, y_tr, X_val, y_val):
 # ======================================================================
 
 @st.cache_resource
-def train_pipeline(jst_path: str):
-    df_raw = load_data(jst_path)
+def train_pipeline(jst_path: str, countries: list[str]):
+    df_raw = load_data(jst_path, countries)
 
-    # USA long-rate map from JST (needed for uploads like Spain)
-    us_ltrate_map = (
-        df_raw[df_raw["country"] == "USA"]
-        .drop_duplicates("year")
-        .set_index("year")["ltrate"]
-        .to_dict()
-    )
-
-    df_feat, base_features = engineer_features(df_raw, us_ltrate_map=us_ltrate_map)
+    df_feat, base_features = engineer_features(df_raw)
     df_clean = clean_data(df_feat, base_features)
     df_target = create_target(df_clean).reset_index(drop=True)
 
     missing_features = [f"{f}_missing" for f in base_features]
     all_features = base_features + missing_features
 
+    # Time split across panel
     train = df_target[df_target["year"] < 1970]
     val   = df_target[(df_target["year"] >= 1970) & (df_target["year"] < 1990)]
     test  = df_target[df_target["year"] >= 1990]
@@ -397,10 +358,7 @@ def train_pipeline(jst_path: str):
     y_val   = val["target"]
     y_test  = test["target"]
 
-    # training medians for robust upload fills
-    base_feature_medians = df_target[base_features].median(numeric_only=True).to_dict()
-
-    # scale continuous only
+    # Scale continuous only
     scaler = StandardScaler()
     Xs_train_cont = scaler.fit_transform(X_train[base_features])
     Xs_val_cont   = scaler.transform(X_val[base_features])
@@ -410,24 +368,24 @@ def train_pipeline(jst_path: str):
     Xs_val   = np.hstack([Xs_val_cont,   X_val[missing_features].values])
     Xs_test  = np.hstack([Xs_test_cont,  X_test[missing_features].values])
 
-    # train models
+    # Train & evaluate
     results = []
     fitted_models = {}
 
     for name, clf in build_model_set().items():
         res = evaluate_model(name, clf, Xs_train, y_train, Xs_val, y_val)
         fitted_models[name] = res["clf"]
-        # Arrow-safe results (exclude estimator)
-        results.append({k: v for k, v in res.items() if k != "clf"})
+        results.append({k: v for k, v in res.items() if k != "clf"})  # Arrow-safe
 
     results_df = pd.DataFrame(results).sort_values("F1", ascending=False).reset_index(drop=True)
+
     best_name = results_df.loc[0, "model"]
     best_thresh = float(results_df.loc[0, "threshold"])
 
-    # test probs for all models
+    # Test probs for all models
     test_probs_by_model = {name: m.predict_proba(Xs_test)[:, 1] for name, m in fitted_models.items()}
 
-    # full scaled matrix aligned to df_target indices
+    # Full scaled matrix aligned to df_target
     X_full = df_target[all_features]
     X_full_cont = scaler.transform(X_full[base_features])
     X_full_scaled = np.hstack([X_full_cont, X_full[missing_features].values])
@@ -446,87 +404,7 @@ def train_pipeline(jst_path: str):
         "y_test": y_test.to_numpy(),
         "X_full_scaled": X_full_scaled,
         "test_probs_by_model": test_probs_by_model,
-        "us_ltrate_map": us_ltrate_map,
-        "base_feature_medians": base_feature_medians,
     }
-
-# ======================================================================
-# Upload & Predict (sidebar)
-# ======================================================================
-
-def run_upload_predict_sidebar(selected_model, scaler, threshold,
-                              base_features, missing_features, all_features,
-                              us_ltrate_map, base_feature_medians):
-    st.sidebar.header("📥 Upload & Predict")
-    uploaded = st.sidebar.file_uploader("Upload CSV", type=["csv"], key="upload_csv")
-
-    if not uploaded:
-        st.sidebar.info("Upload a CSV to generate predictions.")
-        return None
-
-    try:
-        user_df = pd.read_csv(uploaded)
-    except Exception:
-        st.sidebar.error("Could not read CSV. Make sure it is a valid CSV file.")
-        return None
-
-    required_raw = {"country","year","lev","noncore","ltd","hpnom","cpi","tloans","ltrate","stir","money","gdp","ca"}
-    missing_cols = sorted(list(required_raw - set(user_df.columns)))
-    if missing_cols:
-        st.sidebar.error("Missing columns: " + ", ".join(missing_cols[:12]) + ("..." if len(missing_cols) > 12 else ""))
-        return None
-
-    # Macro series (for GDP + house price charts)
-    macro = user_df[["country","year","gdp","hpnom","cpi"]].copy()
-    macro["country"] = macro["country"].astype(str).str.strip()
-    macro["house_price_real"] = macro["hpnom"] / (macro["cpi"] + 1e-9)
-    macro = macro.sort_values(["country","year"])
-
-    # Features engineered using JST USA ltrate map (prevents sovereign_spread all-NaN)
-    df_feat, base_feats_upload = engineer_features(user_df, us_ltrate_map=us_ltrate_map)
-    df_clean = clean_data(df_feat, base_feats_upload)
-
-    # Harden remaining NaNs using training medians (then 0)
-    for col in base_feats_upload:
-        df_clean[col] = df_clean[col].replace([np.inf, -np.inf], np.nan)
-        fill_val = base_feature_medians.get(col, np.nan)
-        if pd.isna(fill_val):
-            fill_val = 0.0
-        df_clean[col] = df_clean[col].fillna(fill_val)
-
-    for col in base_feats_upload:
-        miss_col = f"{col}_missing"
-        if miss_col not in df_clean.columns:
-            df_clean[miss_col] = 0
-
-    for f in all_features:
-        if f not in df_clean.columns:
-            df_clean[f] = 0
-
-    X_u = df_clean[all_features].copy()
-    X_u_cont = scaler.transform(X_u[base_features])
-    X_u_scaled = np.hstack([X_u_cont, X_u[missing_features].values])
-
-    if not np.isfinite(X_u_scaled).all():
-        st.sidebar.error("Upload still contains NaN/Inf after cleaning (cannot predict).")
-        return None
-
-    try:
-        probs = selected_model.predict_proba(X_u_scaled)[:, 1]
-    except Exception:
-        st.sidebar.error("Prediction failed for this model. Try a different model.")
-        return None
-
-    preds = (probs >= threshold).astype(int)
-
-    out = df_clean[["country","year","crisisJST"]].copy()  # crisisJST included if uploaded had it, else 0
-    out["predicted_prob"] = probs
-    out["predicted_class"] = preds
-    out = out.sort_values(["country","year"])
-
-    st.sidebar.success(f"{int(preds.sum())} high-risk rows ({100 * preds.mean():.1f}%)")
-
-    return {"preds": out, "macro": macro}
 
 # ======================================================================
 # SHAP pie (cached per model + sample)
@@ -562,19 +440,46 @@ def get_shap_pie_data(model_key: str, selected_model, Xs_test: np.ndarray, featu
     return df_pie
 
 # ======================================================================
-# Load / Train
+# MAIN
 # ======================================================================
 
 if not JST_XLSX.exists():
     st.error(f"Missing JST dataset file: {JST_XLSX.name}. Put it next to app.py.")
     st.stop()
 
-bundle = train_pipeline(str(JST_XLSX))
+# Choose your default dashboard countries (change if you want)
+DEFAULT_COUNTRIES = ["USA", "UK", "Canada"]
+
+# Train on all 18 advanced economies? or subset?
+# If you want "robust all advanced economies", replace this list with the 18.
+TRAIN_COUNTRIES = [
+    "Australia", "Belgium", "Canada", "Denmark", "Finland", "France",
+    "Germany", "Ireland", "Italy", "Japan", "Netherlands", "Norway",
+    "Portugal", "Spain", "Sweden", "Switzerland", "UK", "USA"
+]
+
+# Sidebar controls
+st.sidebar.header("🎛️ Controls")
+
+# Countries selection used in charts
+country_options = TRAIN_COUNTRIES
+selected_countries = st.sidebar.multiselect(
+    "Countries (charts)",
+    options=country_options,
+    default=[c for c in DEFAULT_COUNTRIES if c in country_options],
+)
+
+if not selected_countries:
+    st.sidebar.warning("Select at least one country.")
+    st.stop()
+
+# Train pipeline (cached)
+bundle = train_pipeline(str(JST_XLSX), TRAIN_COUNTRIES)
+
 df_target = bundle["df_target"]
 base_features = bundle["base_features"]
 missing_features = bundle["missing_features"]
 all_features = bundle["all_features"]
-scaler = bundle["scaler"]
 models = bundle["models"]
 results_df = bundle["results_df"]
 best_name = bundle["best_name"]
@@ -583,152 +488,75 @@ Xs_test = bundle["Xs_test"]
 y_test = bundle["y_test"]
 X_full_scaled = bundle["X_full_scaled"]
 test_probs_by_model = bundle["test_probs_by_model"]
-us_ltrate_map = bundle["us_ltrate_map"]
-base_feature_medians = bundle["base_feature_medians"]
-
-macro_train_df = get_jst_macro_series(str(JST_XLSX))
-
-# ======================================================================
-# Sidebar controls
-# ======================================================================
-
-st.sidebar.header("🎛️ Model & View")
 
 model_names = list(models.keys())
 default_index = model_names.index(best_name) if best_name in model_names else 0
-model_choice = st.sidebar.selectbox("Select model", options=model_names, index=default_index)
+model_choice = st.sidebar.selectbox("Model", options=model_names, index=default_index)
 selected_model = models[model_choice]
 
 threshold = st.sidebar.slider("Risk threshold", 0.05, 0.90, float(best_thresh), 0.01)
 
-st.sidebar.subheader("🧠 SHAP (Tab 1)")
+# Year range
+min_y = int(df_target["year"].min())
+max_y = int(df_target["year"].max())
+from_year, to_year = st.sidebar.slider("Year range", min_y, max_y, (1900, max_y))
+
+# SHAP sample size
 shap_pie_sample_n = st.sidebar.slider("SHAP sample size", 50, 400, 150, 25)
 
-uploaded_bundle = run_upload_predict_sidebar(
-    selected_model=selected_model,
-    scaler=scaler,
-    threshold=threshold,
-    base_features=base_features,
-    missing_features=missing_features,
-    all_features=all_features,
-    us_ltrate_map=us_ltrate_map,
-    base_feature_medians=base_feature_medians,
-)
+# Macro data
+macro_df = get_jst_macro_series(str(JST_XLSX), TRAIN_COUNTRIES)
+macro_df = macro_df[
+    (macro_df["country"].isin(selected_countries)) &
+    (macro_df["year"] >= from_year) &
+    (macro_df["year"] <= to_year)
+].copy()
 
-st.sidebar.subheader("📌 Tab 1 content")
-if uploaded_bundle is not None:
-    tab1_source = st.sidebar.radio("Show on Tab 1", ["Uploaded (your CSV)", "Training (USA/UK/Canada)"], index=0)
-else:
-    tab1_source = st.sidebar.radio("Show on Tab 1", ["Training (USA/UK/Canada)", "Uploaded (your CSV)"], index=0)
+# Risk data
+risk_df = df_target[
+    (df_target["country"].isin(selected_countries)) &
+    (df_target["year"] >= from_year) &
+    (df_target["year"] <= to_year)
+].copy()
 
-use_uploaded_on_tab1 = tab1_source.startswith("Uploaded") and uploaded_bundle is not None
+if risk_df.empty:
+    st.warning("No risk data for selected filters.")
+    st.stop()
 
-# Filters (switch by source)
-if use_uploaded_on_tab1:
-    preds_u = uploaded_bundle["preds"]
-    countries_u = sorted(preds_u["country"].unique())
-    min_y = int(preds_u["year"].min())
-    max_y = int(preds_u["year"].max())
+scaled = X_full_scaled[risk_df.index.to_numpy()]
+risk_df["crisis_prob"] = selected_model.predict_proba(scaled)[:, 1]
 
-    view_countries = st.sidebar.multiselect("Countries (uploaded)", countries_u, default=countries_u)
-    from_year, to_year = st.sidebar.slider("Year range (uploaded)", min_y, max_y, (min_y, max_y))
-else:
-    view_countries = st.sidebar.multiselect("Countries (training)", ["USA", "UK", "Canada"], default=["USA", "UK", "Canada"])
-    min_y = int(df_target["year"].min())
-    max_y = int(df_target["year"].max())
-    from_year, to_year = st.sidebar.slider("Year range (training)", min_y, max_y, (1900, max_y))
+crisis_years_df = risk_df[risk_df["crisisJST"] == 1][["country", "year"]].drop_duplicates()
 
 # ======================================================================
-# Build Tab 1 datasets
+# TABS
 # ======================================================================
 
-if use_uploaded_on_tab1:
-    preds_u = uploaded_bundle["preds"].copy()
-    display_df = preds_u[
-        (preds_u["country"].isin(view_countries)) &
-        (preds_u["year"] >= from_year) &
-        (preds_u["year"] <= to_year)
-    ].copy()
-    display_df["crisis_prob"] = display_df["predicted_prob"]
-
-    # Uploaded crisis years for white vertical lines (requires crisisJST in upload)
-    uploaded_crisis_years = display_df.loc[display_df["crisisJST"] == 1, "year"].dropna().astype(int).tolist()
-
-    macro_df = uploaded_bundle["macro"].copy()
-    macro_df = macro_df[
-        (macro_df["country"].isin(view_countries)) &
-        (macro_df["year"] >= from_year) &
-        (macro_df["year"] <= to_year)
-    ].copy()
-
-else:
-    display_df = df_target[
-        (df_target["country"].isin(view_countries)) &
-        (df_target["year"] >= from_year) &
-        (df_target["year"] <= to_year)
-    ].copy()
-    scaled = X_full_scaled[display_df.index.to_numpy()]
-    display_df["crisis_prob"] = selected_model.predict_proba(scaled)[:, 1]
-
-    crisis_years_df_train = (
-        display_df[display_df["crisisJST"] == 1][["country","year"]]
-        .drop_duplicates()
-        .copy()
-    )
-
-    macro_df = macro_train_df[
-        (macro_train_df["country"].isin(view_countries)) &
-        (macro_train_df["year"] >= from_year) &
-        (macro_train_df["year"] <= to_year)
-    ].copy()
-
-# ======================================================================
-# Tabs
-# ======================================================================
-
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab1, tab2, tab3 = st.tabs([
     "📈 Crisis Risk",
     "📊 Model Results",
-    "📥 Uploaded Predictions",
-    "🧠 SHAP",
     "📂 Data Explorer",
 ])
 
 # -----------------------------------------------------------------------------
-# TAB 1: Risk + GDP + House Prices + SHAP pie (FOR BOTH default and upload)
+# TAB 1: Risk + GDP + House Prices + SHAP pie
 with tab1:
     st.header("Crisis risk over time", divider="gray")
 
-    if display_df.empty:
-        st.warning("No data for the selected filters.")
-        st.stop()
-
-    # Risk chart with crisis overlay
-    if use_uploaded_on_tab1:
-        line_chart_uploaded_with_white_lines(
-            display_df.sort_values(["country","year"]),
-            x_col="year",
-            y_col="crisis_prob",
-            color_col="country",
-            title="Predicted crisis probability (white lines = crisis years from uploaded crisisJST)",
-            crisis_years=uploaded_crisis_years
-        )
-    else:
-        line_chart_training_with_bands(
-            display_df.sort_values(["country","year"]),
-            x_col="year",
-            y_col="crisis_prob",
-            color_col="country",
-            title="Predicted crisis probability (shaded bands = crisis years in JST)",
-            crisis_df=crisis_years_df_train
-        )
+    line_chart_training_with_bands(
+        risk_df.sort_values(["country", "year"]),
+        x_col="year",
+        y_col="crisis_prob",
+        color_col="country",
+        title="Predicted crisis probability (shaded bands = crisis years in JST)",
+        crisis_df=crisis_years_df,
+    )
 
     st.write("")
     st.subheader(f"Crisis summary ({to_year})", divider="gray")
-
-    latest = display_df[display_df["year"] == to_year]
-    cols = st.columns(min(4, max(1, len(view_countries))))
-    for i, c in enumerate(view_countries):
+    latest = risk_df[risk_df["year"] == to_year]
+    cols = st.columns(min(4, max(1, len(selected_countries))))
+    for i, c in enumerate(selected_countries):
         with cols[i % len(cols)]:
             val = latest[latest["country"] == c]["crisis_prob"].mean()
             if pd.isna(val):
@@ -748,56 +576,34 @@ with tab1:
     st.subheader("Macro context + explainability", divider="gray")
     left, right = st.columns(2)
 
-    # ---- LEFT: GDP + House Prices (FOR BOTH)
+    # ---- LEFT: GDP + House Prices
     with left:
-        st.markdown("### 🌍 GDP")
+        st.markdown("### 🌍 GDP (from JST)")
         if "gdp" in macro_df.columns and not macro_df["gdp"].isna().all():
-            if use_uploaded_on_tab1:
-                # (optional) add the same white crisis lines on macro charts if crisis years exist
-                line_chart_uploaded_with_white_lines(
-                    macro_df.sort_values(["country","year"]),
-                    x_col="year",
-                    y_col="gdp",
-                    color_col="country",
-                    title="GDP (uploaded/training source depending on Tab 1)",
-                    crisis_years=uploaded_crisis_years if use_uploaded_on_tab1 else []
-                )
-            else:
-                # training: no need to band macro chart; you can band if you want, but keeping clean
-                line_chart_simple(
-                    macro_df.sort_values(["country","year"]),
-                    x_col="year",
-                    y_col="gdp",
-                    color_col="country",
-                    title="GDP (JST)"
-                )
+            line_chart_simple(
+                macro_df.sort_values(["country", "year"]),
+                x_col="year",
+                y_col="gdp",
+                color_col="country",
+                title="GDP",
+            )
         else:
-            st.info("GDP not available for the selected data/years.")
+            st.info("GDP not available for the selected countries/years.")
 
         st.write("")
         st.markdown("### 🏠 Real house prices (hpnom / cpi)")
         if "house_price_real" in macro_df.columns and not macro_df["house_price_real"].isna().all():
-            if use_uploaded_on_tab1:
-                line_chart_uploaded_with_white_lines(
-                    macro_df.sort_values(["country","year"]),
-                    x_col="year",
-                    y_col="house_price_real",
-                    color_col="country",
-                    title="Real house prices",
-                    crisis_years=uploaded_crisis_years if use_uploaded_on_tab1 else []
-                )
-            else:
-                line_chart_simple(
-                    macro_df.sort_values(["country","year"]),
-                    x_col="year",
-                    y_col="house_price_real",
-                    color_col="country",
-                    title="Real house prices (JST)"
-                )
+            line_chart_simple(
+                macro_df.sort_values(["country", "year"]),
+                x_col="year",
+                y_col="house_price_real",
+                color_col="country",
+                title="Real house prices",
+            )
         else:
-            st.info("House price data not available for the selected data/years.")
+            st.info("House price data not available for the selected countries/years.")
 
-    # ---- RIGHT: SHAP pie + explanation (FOR BOTH)
+    # ---- RIGHT: SHAP pie + explanation under it
     with right:
         st.markdown("### 🧠 SHAP Explainability")
         st.caption("Pie = **mean(|SHAP|)** across sampled test rows → share of total feature influence (global importance).")
@@ -821,18 +627,20 @@ with tab1:
 
             if PLOTLY_OK:
                 fig = px.pie(
-                    top, names="Feature", values="Share",
+                    top,
+                    names="Feature",
+                    values="Share",
                     hover_data={"Share_%": True, "Share": True},
                     title="SHAP Feature Impact Share (mean |SHAP|)"
                 )
                 fig.update_layout(
-                    height=520, margin=dict(l=10, r=10, t=60, b=20),
+                    height=520,
+                    margin=dict(l=10, r=10, t=60, b=20),
                     showlegend=False
                 )
-                fig.update_traces(textposition="outside", textinfo="percent+label", textfont_size=14, pull=[0.02]*len(top))
+                fig.update_traces(textposition="outside", textinfo="percent+label", textfont_size=14)
                 st.plotly_chart(fig, use_container_width=True)
             else:
-                # fallback: matplotlib pie (not interactive)
                 plt.figure(figsize=(7, 6))
                 plt.pie(
                     top["Share"].tolist(),
@@ -844,7 +652,6 @@ with tab1:
                 st.pyplot(plt.gcf(), clear_figure=True)
                 st.info("For an interactive pie chart, add `plotly` to requirements.txt and redeploy.")
 
-            # Explanation under the pie (as requested)
             st.markdown(
                 """
 **What SHAP values are**
@@ -894,75 +701,11 @@ with tab2:
     st.dataframe(pd.DataFrame(cm, index=["Actual 0", "Actual 1"], columns=["Pred 0", "Pred 1"]), use_container_width=True)
 
 # -----------------------------------------------------------------------------
-# TAB 3: Uploaded predictions + chart + download
+# TAB 3: Data Explorer
 with tab3:
-    st.header("Predictions from uploaded CSV", divider="gray")
-
-    if uploaded_bundle is None:
-        st.info("Upload a CSV from the sidebar to view predictions here.")
-    else:
-        uploaded_preds = uploaded_bundle["preds"].copy()
-        st.dataframe(uploaded_preds, use_container_width=True)
-
-        st.write("")
-        st.subheader("Uploaded risk over time", divider="gray")
-        tmp = uploaded_preds.copy()
-        tmp["crisis_prob"] = tmp["predicted_prob"]
-        crisis_years = tmp.loc[tmp["crisisJST"] == 1, "year"].dropna().astype(int).tolist()
-
-        line_chart_uploaded_with_white_lines(
-            tmp.sort_values(["country","year"]),
-            x_col="year",
-            y_col="crisis_prob",
-            color_col="country",
-            title="Uploaded predicted crisis probability (white lines = uploaded crisisJST years)",
-            crisis_years=crisis_years
-        )
-
-        csv_bytes = uploaded_preds.to_csv(index=False).encode("utf-8")
-        st.download_button("Download predictions as CSV", data=csv_bytes, file_name="uploaded_predictions.csv", mime="text/csv")
-
-# -----------------------------------------------------------------------------
-# TAB 4: Detailed SHAP plots (optional)
-with tab4:
-    st.header("SHAP explainability (detailed)", divider="gray")
-    st.markdown(
-        """
-SHAP explains individual predictions by distributing the difference between the prediction and a baseline
-across the features.
-
-- **Positive SHAP** increases predicted crisis risk.
-- **Negative SHAP** decreases predicted crisis risk.
-- **Mean absolute SHAP** is used for global importance (what your pie chart shows).
-"""
-    )
-
-    sample_n = st.slider("Sample size (rows)", 50, 500, 200, 25, key="shap_sample_n_tab4")
-    plot_type = st.selectbox("Plot type", ["bar", "dot"], index=0)
-
-    if st.button("Compute SHAP summary", type="primary"):
-        with st.spinner("Computing SHAP..."):
-            feature_names = all_features
-            X_test_shap = pd.DataFrame(Xs_test, columns=feature_names)
-            Xsamp = X_test_shap.sample(n=min(sample_n, len(X_test_shap)), random_state=42)
-
-            explainer = shap.Explainer(selected_model, X_test_shap)
-            shap_vals = explainer(Xsamp)
-
-            plt.figure()
-            if plot_type == "bar":
-                shap.summary_plot(shap_vals, Xsamp, plot_type="bar", show=False)
-            else:
-                shap.summary_plot(shap_vals, Xsamp, show=False)
-
-            st.pyplot(plt.gcf(), clear_figure=True)
-
-# -----------------------------------------------------------------------------
-# TAB 5: Data Explorer
-with tab5:
     st.header("Data explorer (processed dataset used for modelling)", divider="gray")
     show_cols = ["country", "year", "crisisJST", "target"] + all_features
-    st.dataframe(df_target[show_cols].sort_values(["country","year"]).tail(150), use_container_width=True)
+    st.dataframe(df_target[show_cols].sort_values(["country", "year"]).tail(180), use_container_width=True)
 
     with st.expander("Show feature lists"):
         st.write("**Base (continuous) features**:", base_features)
