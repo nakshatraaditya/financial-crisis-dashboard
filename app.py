@@ -5,11 +5,13 @@
 #   - Proper scaling (continuous only)
 #   - Multi-model validation + best model selection
 #   - SHAP explainability
-#  Requested updates:
-#   ✅ Interactive SHAP pie chart on FIRST page (Plotly)
-#   ✅ GDP chart on FIRST page defaults to USA/UK/Canada when NO upload
-#  Fix included:
-#   ✅ results_df Arrow-safe (no sklearn objects inside dataframe)
+#
+#  Updates (requested):
+#   ✅ GDP chart uses JSTdatasetR6.xlsx (NO external gdp_data.csv needed)
+#   ✅ SHAP pie chart shown on FIRST page (interactive if Plotly installed,
+#      otherwise falls back to Matplotlib)
+#   ✅ GDP defaults to USA/UK/Canada (and respects country filter)
+#   ✅ results_df Arrow-safe (no sklearn objects)
 # ======================================================================
 
 import streamlit as st
@@ -17,9 +19,14 @@ import pandas as pd
 import numpy as np
 import math
 from pathlib import Path
-
 import matplotlib.pyplot as plt
-import plotly.express as px
+
+# Optional Plotly (interactive pie). If not installed, app still runs.
+try:
+    import plotly.express as px
+    PLOTLY_OK = True
+except Exception:
+    PLOTLY_OK = False
 
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
@@ -51,23 +58,24 @@ st.set_page_config(
 
 APP_DIR = Path(__file__).parent
 JST_XLSX = APP_DIR / "JSTdatasetR6.xlsx"
-GDP_CSV  = APP_DIR / "data" / "gdp_data.csv"
 
 # -----------------------------------------------------------------------------
 # HEADER
 """
 # 📉 Financial Crisis Early Warning System (EWS)
 
+This dashboard implements your **multi-model dissertation pipeline**:
 - Missing-value flags + causal imputation  
 - Proper scaling (continuous only)  
 - Validation-based model selection + threshold optimization  
-- SHAP explainability (interactive pie on first page)  
-- GDP context (defaults to USA/UK/Canada unless user upload provides countries)  
+- SHAP explainability  
+- Crisis risk timeline + JST macro context (GDP + Real House Prices)  
+- Upload & Predict in the **sidebar**
 """
 st.write("")
 
 # -----------------------------------------------------------------------------
-# Optional cache reset button
+# Cache reset
 with st.sidebar:
     if st.button("Clear cache & rerun"):
         st.cache_data.clear()
@@ -75,24 +83,27 @@ with st.sidebar:
         st.rerun()
 
 # ======================================================================
-# 1) GDP LOADER (Template-Style)
+# 1) JST MACRO DATA (GDP + House prices) FOR CHARTS
 # ======================================================================
 
 @st.cache_data
-def get_gdp_data(filepath: Path) -> pd.DataFrame:
-    raw_gdp_df = pd.read_csv(filepath)
+def get_jst_macro_series(jst_path: str) -> pd.DataFrame:
+    df = pd.read_excel(jst_path)
+    df = df[df["country"].isin(["USA", "UK", "Canada"])].copy()
+    df = df.sort_values(["country", "year"])
 
-    MIN_YEAR = 1960
-    MAX_YEAR = 2022
+    keep_cols = ["country", "year"]
+    for c in ["gdp", "hpnom", "cpi"]:
+        if c in df.columns:
+            keep_cols.append(c)
 
-    gdp_df = raw_gdp_df.melt(
-        ["Country Code"],
-        [str(x) for x in range(MIN_YEAR, MAX_YEAR + 1)],
-        "Year",
-        "GDP",
-    )
-    gdp_df["Year"] = pd.to_numeric(gdp_df["Year"])
-    return gdp_df
+    out = df[keep_cols].copy()
+
+    # Real house prices (if possible)
+    if "hpnom" in out.columns and "cpi" in out.columns:
+        out["house_price_real"] = out["hpnom"] / (out["cpi"] + 1e-9)
+
+    return out
 
 
 # ======================================================================
@@ -272,7 +283,7 @@ def train_pipeline(jst_path: str):
     df_feat, base_features = engineer_features(df_raw)
     df_clean = clean_data(df_feat, base_features)
 
-    # Important: reset index so X_full_scaled aligns safely by row position
+    # reset index so alignment by row-position is safe
     df_target = create_target(df_clean).reset_index(drop=True)
 
     missing_features = [f"{f}_missing" for f in base_features]
@@ -290,7 +301,6 @@ def train_pipeline(jst_path: str):
     y_val   = val["target"]
     y_test  = test["target"]
 
-    # Scale continuous only
     scaler = StandardScaler()
     Xs_train_cont = scaler.fit_transform(X_train[base_features])
     Xs_val_cont   = scaler.transform(X_val[base_features])
@@ -300,15 +310,13 @@ def train_pipeline(jst_path: str):
     Xs_val   = np.hstack([Xs_val_cont,   X_val[missing_features].values])
     Xs_test  = np.hstack([Xs_test_cont,  X_test[missing_features].values])
 
-    # Train & evaluate
     results = []
     fitted_models = {}
 
     for name, clf in build_model_set().items():
         res = evaluate_model(name, clf, Xs_train, y_train, Xs_val, y_val)
         fitted_models[name] = res["clf"]
-
-        # Arrow-safe results table: exclude sklearn object
+        # Arrow-safe (exclude model object)
         results.append({k: v for k, v in res.items() if k != "clf"})
 
     results_df = pd.DataFrame(results).sort_values("F1", ascending=False).reset_index(drop=True)
@@ -316,12 +324,10 @@ def train_pipeline(jst_path: str):
     best_name = results_df.loc[0, "model"]
     best_thresh = float(results_df.loc[0, "threshold"])
 
-    # Test probs for ALL models
     test_probs_by_model = {}
     for name, clf in fitted_models.items():
         test_probs_by_model[name] = clf.predict_proba(Xs_test)[:, 1]
 
-    # Full scaled matrix aligned to df_target (index-reset = safe by row position)
     X_full = df_target[all_features]
     X_full_cont = scaler.transform(X_full[base_features])
     X_full_scaled = np.hstack([X_full_cont, X_full[missing_features].values])
@@ -390,12 +396,12 @@ def run_upload_predict_sidebar(selected_model, scaler, threshold, base_features,
 
 
 # ======================================================================
-# 5) SHAP PIE (cached per model + sample size in session_state)
+# 5) SHAP PIE (cached per model + sample size)
 # ======================================================================
 
 def get_shap_pie_data(model_key: str, selected_model, Xs_test: np.ndarray, feature_names: list, sample_n: int):
     """
-    Returns a dataframe with Feature + Share for mean(|SHAP|) across sampled test rows.
+    Returns df: Feature, Share using mean(|SHAP|) across sampled test rows.
     Cached in st.session_state to avoid recomputation on reruns.
     """
     if "shap_pie_cache" not in st.session_state:
@@ -412,9 +418,8 @@ def get_shap_pie_data(model_key: str, selected_model, Xs_test: np.ndarray, featu
     shap_vals = explainer(Xsamp)
 
     values = shap_vals.values
-    # Some explainers return (n, p, 2) for binary; use positive class
     if values.ndim == 3:
-        values = values[:, :, 1]
+        values = values[:, :, 1]  # positive class
 
     mean_abs = np.mean(np.abs(values), axis=0)
     total = float(mean_abs.sum()) + 1e-12
@@ -451,15 +456,7 @@ y_test = bundle["y_test"]
 X_full_scaled = bundle["X_full_scaled"]
 test_probs_by_model = bundle["test_probs_by_model"]
 
-# GDP optional
-gdp_df = get_gdp_data(GDP_CSV) if GDP_CSV.exists() else None
-
-# Mapping JST -> World Bank codes (GDP CSV uses ISO3)
-GDP_CODE_MAP = {
-    "USA": "USA",
-    "UK": "GBR",
-    "Canada": "CAN",
-}
+macro_df = get_jst_macro_series(str(JST_XLSX))
 
 # ======================================================================
 # 7) SIDEBAR CONTROLS
@@ -522,7 +519,7 @@ uploaded_preds = run_upload_predict_sidebar(
 )
 
 # ======================================================================
-# 8) PREPARE RISK DF (full timeline probs)
+# 8) PREPARE RISK DF (timeline probs)
 # ======================================================================
 
 risk_df = df_target[
@@ -531,7 +528,6 @@ risk_df = df_target[
     (df_target["year"] <= to_year)
 ].copy()
 
-# df_target index is 0..n-1 (reset), so row-position selection is safe
 risk_scaled = X_full_scaled[risk_df.index.to_numpy()]
 risk_df["crisis_prob"] = selected_model.predict_proba(risk_scaled)[:, 1]
 
@@ -539,29 +535,23 @@ risk_df["crisis_prob"] = selected_model.predict_proba(risk_scaled)[:, 1]
 # 9) TABS
 # ======================================================================
 
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "📈 Crisis Risk",
     "📊 Model Results",
     "📥 Uploaded Predictions",
     "🧠 SHAP",
-    "🌍 GDP",
     "📂 Data Explorer",
 ])
 
 # -----------------------------------------------------------------------------
-# TAB 1: Crisis Risk + Interactive SHAP pie + GDP default USA/UK/Canada if no upload
+# TAB 1: Crisis Risk + JST GDP + Real House Prices + SHAP pie
 with tab1:
     st.header("Crisis risk over time", divider="gray")
 
     if risk_df.empty:
         st.warning("No data for the selected filters.")
     else:
-        st.line_chart(
-            risk_df,
-            x="year",
-            y="crisis_prob",
-            color="country",
-        )
+        st.line_chart(risk_df, x="year", y="crisis_prob", color="country")
 
         st.write("")
         st.subheader(f"Risk summary ({to_year})", divider="gray")
@@ -570,8 +560,7 @@ with tab1:
         cols = st.columns(3)
 
         for i, c in enumerate(risk_countries):
-            col = cols[i % len(cols)]
-            with col:
+            with cols[i % 3]:
                 val = latest[latest["country"] == c]["crisis_prob"].mean()
                 if pd.isna(val):
                     st.metric(label=f"{c} risk", value="n/a")
@@ -590,56 +579,35 @@ with tab1:
                     st.write(f"**{c}:** " + (", ".join(map(str, years)) if years else "none"))
 
         st.write("")
-        st.subheader("Context + Explainability (first page)", divider="gray")
+        st.subheader("JST macro context + explainability", divider="gray")
 
         left, right = st.columns(2)
 
-        # --- LEFT: GDP chart (defaults to USA/UK/Canada if no upload) ---
+        # --- LEFT: GDP & House prices from JSTdatasetR6.xlsx ---
         with left:
-            st.markdown("### 🌍 GDP (World Bank)")
-            if gdp_df is None:
-                st.warning("GDP file not found. Add /data/gdp_data.csv to enable GDP charts.")
+            st.markdown("### 🌍 GDP (JST variable)")
+            macro_filtered = macro_df[
+                (macro_df["country"].isin(risk_countries)) &
+                (macro_df["year"] >= from_year) &
+                (macro_df["year"] <= to_year)
+            ].copy()
+
+            if "gdp" in macro_filtered.columns:
+                st.line_chart(macro_filtered, x="year", y="gdp", color="country")
+                st.caption("This chart uses the **JST `gdp` variable** (check JST codebook for exact definition/units).")
             else:
-                # Default GDP codes if user has not uploaded any data
-                if uploaded_preds is None:
-                    gdp_codes = ["USA", "GBR", "CAN"]
-                else:
-                    uploaded_countries = uploaded_preds["country"].dropna().unique().tolist()
-                    mapped = []
-                    for c in uploaded_countries:
-                        c = str(c)
-                        if c in GDP_CODE_MAP:
-                            mapped.append(GDP_CODE_MAP[c])
-                        elif len(c) == 3:
-                            mapped.append(c.upper())
-                    gdp_codes = sorted(list(set(mapped))) if mapped else ["USA", "GBR", "CAN"]
+                st.warning("Column `gdp` not found in JSTdatasetR6.xlsx")
 
-                # Clip year range to GDP dataset range
-                g_from = max(1960, int(from_year))
-                g_to = min(2022, int(to_year))
+            st.write("")
+            st.markdown("### 🏠 Real house prices (hpnom / cpi)")
+            if "house_price_real" in macro_filtered.columns:
+                st.line_chart(macro_filtered, x="year", y="house_price_real", color="country")
+            else:
+                st.info("House price columns not available to compute real house prices.")
 
-                gdp_filtered = gdp_df[
-                    (gdp_df["Country Code"].isin(gdp_codes)) &
-                    (gdp_df["Year"] >= g_from) &
-                    (gdp_df["Year"] <= g_to)
-                ].copy()
-
-                gdp_filtered["GDP_B"] = gdp_filtered["GDP"] / 1e9
-
-                if gdp_filtered.empty:
-                    st.info("No GDP data for selected countries/year window.")
-                else:
-                    st.line_chart(
-                        gdp_filtered,
-                        x="Year",
-                        y="GDP_B",
-                        color="Country Code"
-                    )
-                    st.caption("GDP shown in **billions** (default: USA/GBR/CAN).")
-
-        # --- RIGHT: SHAP Pie chart (interactive Plotly) ---
+        # --- RIGHT: SHAP pie (interactive if Plotly installed) ---
         with right:
-            st.markdown("### 🧠 SHAP pie (interactive)")
+            st.markdown("### 🧠 SHAP pie (feature impact share)")
             st.caption("Pie uses **mean(|SHAP|)** across sampled test rows (share of total influence).")
 
             top_k = 10
@@ -652,39 +620,47 @@ with tab1:
                     sample_n=shap_pie_sample_n
                 )
 
-                # Top-k + Other
                 top = shap_pie_df.head(top_k).copy()
                 other_share = float(shap_pie_df["Share"].iloc[top_k:].sum()) if len(shap_pie_df) > top_k else 0.0
                 if other_share > 0:
-                    top = pd.concat(
-                        [top, pd.DataFrame([{"Feature": "Other", "Share": other_share}])],
-                        ignore_index=True
-                    )
+                    top = pd.concat([top, pd.DataFrame([{"Feature": "Other", "Share": other_share}])], ignore_index=True)
 
                 top["Share_%"] = top["Share"] * 100
 
-                fig = px.pie(
-                    top,
-                    names="Feature",
-                    values="Share",
-                    hover_data=["Share_%"],
-                    title="SHAP Feature Impact Share (mean |SHAP|)"
-                )
-                fig.update_traces(textposition="inside", textinfo="percent+label")
-                st.plotly_chart(fig, use_container_width=True)
+                if PLOTLY_OK:
+                    fig = px.pie(
+                        top,
+                        names="Feature",
+                        values="Share",
+                        hover_data=["Share_%"],
+                        title="SHAP Feature Impact Share (mean |SHAP|)"
+                    )
+                    fig.update_traces(textposition="inside", textinfo="percent+label")
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    # fallback to matplotlib
+                    labels = top["Feature"].tolist()
+                    sizes = top["Share"].tolist()
+                    plt.figure()
+                    plt.pie(
+                        sizes,
+                        labels=labels,
+                        autopct=lambda p: f"{p:.1f}%" if p >= 4 else ""
+                    )
+                    plt.title("SHAP Feature Impact Share (mean |SHAP|)")
+                    st.pyplot(plt.gcf(), clear_figure=True)
+                    st.info("Install `plotly` to make the pie chart interactive (add it to requirements.txt).")
 
                 st.caption(
-                    "Bigger slice = feature has larger overall influence on predicted crisis risk. "
+                    "Bigger slice = feature has greater overall influence on predicted crisis risk. "
                     "Pie shows magnitude share, not direction (↑/↓)."
                 )
+
             except Exception:
-                st.warning(
-                    "SHAP pie could not be computed for this model. "
-                    "Try Gradient Boosting / Random Forest or reduce SHAP sample size."
-                )
+                st.warning("SHAP pie could not be computed for this model. Try Gradient Boosting/Random Forest or reduce SHAP sample size.")
 
 # -----------------------------------------------------------------------------
-# TAB 2: Model results
+# TAB 2: Model Results
 with tab2:
     st.header("Model comparison (validation)", divider="gray")
     st.dataframe(results_df, use_container_width=True)
@@ -715,7 +691,7 @@ with tab2:
     st.dataframe(cm_df, use_container_width=True)
 
 # -----------------------------------------------------------------------------
-# TAB 3: Uploaded predictions
+# TAB 3: Uploaded Predictions
 with tab3:
     st.header("Predictions from uploaded CSV", divider="gray")
 
@@ -742,26 +718,25 @@ with tab3:
         )
 
 # -----------------------------------------------------------------------------
-# TAB 4: SHAP (detailed explanation + standard summary plot)
+# TAB 4: SHAP (detailed)
 with tab4:
     st.header("SHAP explainability", divider="gray")
 
     st.markdown(
         """
 **What are SHAP values?**  
-SHAP (SHapley Additive exPlanations) explains model predictions by assigning each feature a contribution.
+SHAP (SHapley Additive exPlanations) explains a model prediction by attributing it to individual feature contributions.
 
 For a single observation:
 
 **prediction = base value + sum(feature contributions)**
 
 **Interpretation**
-- **Positive SHAP value** → pushes the prediction **towards crisis (higher risk)**
-- **Negative SHAP value** → pushes the prediction **away from crisis (lower risk)**
-- Larger **|SHAP|** → stronger influence on the prediction
+- **Positive SHAP** → pushes prediction **towards crisis (higher risk)**
+- **Negative SHAP** → pushes prediction **away from crisis (lower risk)**
+- Larger **|SHAP|** → stronger effect
 
-**Note:** The pie chart uses **mean absolute SHAP** (global importance share), so it shows *how much* a feature matters overall,
-but not whether it pushes risk up or down on average.
+**Note:** Pie chart uses **mean absolute SHAP** (importance share), which shows *how much* a feature matters overall, not direction.
 """
     )
 
@@ -786,61 +761,8 @@ but not whether it pushes risk up or down on average.
             st.pyplot(plt.gcf(), clear_figure=True)
 
 # -----------------------------------------------------------------------------
-# TAB 5: GDP (full template-style explorer)
+# TAB 5: Data Explorer
 with tab5:
-    st.header("🌍 GDP dashboard", divider="gray")
-
-    if gdp_df is None:
-        st.warning(
-            f"GDP file not found at: {GDP_CSV}. "
-            "Add the World Bank template file to /data/gdp_data.csv to enable this tab."
-        )
-    else:
-        st.caption("Template-style (slider + multiselect + line_chart + metrics).")
-
-        gdp_min = int(gdp_df["Year"].min())
-        gdp_max = int(gdp_df["Year"].max())
-
-        g_from_year, g_to_year = st.slider(
-            "Which years are you interested in?",
-            min_value=gdp_min,
-            max_value=gdp_max,
-            value=(gdp_min, gdp_max),
-            key="gdp_year_slider"
-        )
-
-        g_countries = sorted(gdp_df["Country Code"].unique())
-
-        g_selected = st.multiselect(
-            "Which countries would you like to view?",
-            g_countries,
-            default=["USA", "GBR", "CAN"],
-            key="gdp_country_selector"
-        )
-
-        if not g_selected:
-            st.warning("Select at least one country")
-            st.stop()
-
-        filtered_gdp_df = gdp_df[
-            (gdp_df["Country Code"].isin(g_selected))
-            & (gdp_df["Year"] <= g_to_year)
-            & (g_from_year <= gdp_df["Year"])
-        ].copy()
-
-        filtered_gdp_df["GDP_B"] = filtered_gdp_df["GDP"] / 1e9
-
-        st.subheader("GDP over time (billions)", divider="gray")
-        st.line_chart(
-            filtered_gdp_df,
-            x="Year",
-            y="GDP_B",
-            color="Country Code",
-        )
-
-# -----------------------------------------------------------------------------
-# TAB 6: Data Explorer
-with tab6:
     st.header("Data explorer (processed)", divider="gray")
     st.caption("Cleaned + engineered dataset used for modelling (includes missing flags + target).")
 
