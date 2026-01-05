@@ -3,19 +3,16 @@
 #  (UPLOAD REMOVED COMPLETELY)
 #
 #  ✅ No sidebar upload / no upload tab
-#  ✅ Interactive RGB country charts (Altair if installed; falls back to st.line_chart)
+#  ✅ Interactive RGB country charts (Altair if available; st.line_chart fallback)
 #  ✅ Crisis Risk tab includes:
 #       - Risk timeline with crisis-year shading (JST crisisJST)
 #       - Crisis summary as PERCENTAGE
 #       - GDP + Real House Price charts (from JST)
-#       - SHAP pie chart + explanation directly underneath
+#       - SHAP pie chart + explanation
+#       - NEW: Top-6 SHAP bar chart + explanations (Tab 1)
 #  ✅ Model Results tab (Arrow-safe results_df)
 #  ✅ SHAP detailed tab (summary plot)
 #  ✅ Data Explorer tab
-#
-#  Optional deps:
-#   - plotly (for interactive pie). If missing → matplotlib pie fallback.
-#   - altair (for RGB colors + shaded crisis bands). If missing → st.line_chart fallback.
 # ======================================================================
 
 import streamlit as st
@@ -25,14 +22,7 @@ import math
 from pathlib import Path
 import matplotlib.pyplot as plt
 
-# Optional Plotly (interactive pie)
-try:
-    import plotly.express as px
-    PLOTLY_OK = True
-except Exception:
-    PLOTLY_OK = False
-
-# Optional Altair (RGB charts + crisis shading)
+# Optional Altair (interactive + RGB + shading + pie)
 try:
     import altair as alt
     ALTAIR_OK = True
@@ -96,6 +86,25 @@ def build_color_scale(categories):
             domain.append(c)
     range_colors = [COUNTRY_RGB.get(c, stable_rgb(c)) for c in domain]
     return domain, range_colors
+
+# -----------------------------------------------------------------------------
+# SHAP feature explanations (used for Top-6 explanation in Tab 1)
+FEATURE_EXPLANATIONS = {
+    "housing_bubble": "Deviation of real house prices from a 10-year rolling trend (proxy for housing overvaluation).",
+    "credit_growth": "Growth in real bank credit (tloans/cpi). Rapid increases often signal overheating/leverage build-up.",
+    "banking_fragility": "Composite fragility index from expanding z-scores of noncore funding, LTD, and leverage risk.",
+    "sovereign_spread": "Long-term rate minus USA long-term rate (proxy for risk premium / differential vs US benchmark).",
+    "yield_curve": "Term spread (ltrate − stir). Flattening/inversion can reflect tighter conditions and recession risk.",
+    "money_expansion": "Change in money-to-GDP ratio (proxy for liquidity expansion / credit conditions).",
+    "ca_gdp": "Current account balance scaled by GDP (external imbalances can amplify crisis risk).",
+}
+
+def explain_feature(name: str) -> str:
+    if name.endswith("_missing"):
+        base = name.replace("_missing", "")
+        base_desc = FEATURE_EXPLANATIONS.get(base, "Base feature missingness indicator.")
+        return f"Missing-value flag for `{base}` (1 if missing, else 0). Captures information in data gaps. Base meaning: {base_desc}"
+    return FEATURE_EXPLANATIONS.get(name, "Engineered macro-financial indicator used by the model.")
 
 # -----------------------------------------------------------------------------
 # HEADER
@@ -294,7 +303,7 @@ def train_pipeline(jst_path: str):
     missing_features = [f"{f}_missing" for f in base_features]
     all_features = base_features + missing_features
 
-    # Train/Val/Test time split (as you used before)
+    # Train/Val/Test time split
     train = df_target[df_target["year"] < 1970]
     val   = df_target[(df_target["year"] >= 1970) & (df_target["year"] < 1990)]
     test  = df_target[df_target["year"] >= 1990]
@@ -324,17 +333,14 @@ def train_pipeline(jst_path: str):
     for name, clf in build_model_set().items():
         res = evaluate_model(name, clf, Xs_train, y_train, Xs_val, y_val)
         fitted_models[name] = res["clf"]
-        # Arrow-safe (exclude estimator object)
-        results.append({k: v for k, v in res.items() if k != "clf"})
+        results.append({k: v for k, v in res.items() if k != "clf"})  # Arrow-safe
 
     results_df = pd.DataFrame(results).sort_values("F1", ascending=False).reset_index(drop=True)
     best_name = results_df.loc[0, "model"]
     best_thresh = float(results_df.loc[0, "threshold"])
 
-    # Test probabilities for each model
     test_probs_by_model = {name: m.predict_proba(Xs_test)[:, 1] for name, m in fitted_models.items()}
 
-    # Full scaled matrix aligned to df_target indices (for timeline predictions)
     X_full = df_target[all_features]
     X_full_cont = scaler.transform(X_full[base_features])
     X_full_scaled = np.hstack([X_full_cont, X_full[missing_features].values])
@@ -360,8 +366,13 @@ def train_pipeline(jst_path: str):
 # Chart helpers
 # ======================================================================
 
-def altair_line(df, x_col, y_col, color_col, title, height=320):
+def altair_line(df, x_col, y_col, color_col, title, height=320, y_format=None):
     domain, range_colors = build_color_scale(df[color_col].unique())
+    tooltip = [
+        alt.Tooltip(f"{color_col}:N"),
+        alt.Tooltip(f"{x_col}:Q"),
+        alt.Tooltip(f"{y_col}:Q", format=y_format if y_format else ".6f"),
+    ]
     base = alt.Chart(df).encode(
         x=alt.X(f"{x_col}:Q", title=x_col),
         y=alt.Y(f"{y_col}:Q", title=y_col),
@@ -370,17 +381,11 @@ def altair_line(df, x_col, y_col, color_col, title, height=320):
             scale=alt.Scale(domain=domain, range=range_colors),
             legend=alt.Legend(title=color_col),
         ),
-        tooltip=[
-            alt.Tooltip(f"{color_col}:N"),
-            alt.Tooltip(f"{x_col}:Q"),
-            alt.Tooltip(f"{y_col}:Q", format=".6f"),
-        ],
+        tooltip=tooltip,
     )
     return base.mark_line().properties(height=height, title=title).interactive()
 
 def altair_risk_with_crisis_bands(risk_df, crisis_df, title, threshold=None):
-    # risk_df: year,country,crisis_prob
-    # crisis_df: country,year
     domain, range_colors = build_color_scale(risk_df["country"].unique())
 
     line = alt.Chart(risk_df).mark_line().encode(
@@ -392,12 +397,11 @@ def altair_risk_with_crisis_bands(risk_df, crisis_df, title, threshold=None):
 
     layers = []
 
-    # shaded crisis bands
     if crisis_df is not None and not crisis_df.empty:
         cdf = crisis_df.copy()
         cdf["x_start"] = cdf["year"] - 0.5
         cdf["x_end"] = cdf["year"] + 0.5
-        rect = alt.Chart(cdf).mark_rect(opacity=0.15).encode(
+        rect = alt.Chart(cdf).mark_rect(opacity=0.18).encode(
             x="x_start:Q", x2="x_end:Q",
             y=alt.value(0), y2=alt.value(1),
             color=alt.Color("country:N", scale=alt.Scale(domain=domain, range=range_colors), legend=None),
@@ -406,14 +410,19 @@ def altair_risk_with_crisis_bands(risk_df, crisis_df, title, threshold=None):
 
     layers.append(line)
 
-    # threshold rule
     if threshold is not None:
-        rule = alt.Chart(pd.DataFrame({"y":[float(threshold)]})).mark_rule(strokeDash=[6,4], opacity=0.9).encode(y="y:Q")
+        rule = alt.Chart(pd.DataFrame({"y":[float(threshold)]})).mark_rule(strokeDash=[6,4], opacity=0.95).encode(y="y:Q")
         layers.append(rule)
 
     return alt.layer(*layers).properties(height=320, title=title).interactive()
 
-def shap_pie(selected_model, Xs_test, feature_names, sample_n=150, top_k=8, title="SHAP Feature Impact Share (mean |SHAP|)"):
+def compute_shap_global(selected_model, Xs_test, feature_names, sample_n=150):
+    """
+    Returns a dataframe with:
+      - mean_abs (mean |SHAP|)
+      - mean_signed (mean SHAP)
+      - share (mean_abs / sum(mean_abs))
+    """
     X_test_shap = pd.DataFrame(Xs_test, columns=feature_names)
     Xsamp = X_test_shap.sample(n=min(sample_n, len(X_test_shap)), random_state=42)
 
@@ -421,45 +430,74 @@ def shap_pie(selected_model, Xs_test, feature_names, sample_n=150, top_k=8, titl
     shap_vals = explainer(Xsamp)
 
     values = shap_vals.values
-    if values.ndim == 3:
+    if values.ndim == 3:  # (n, features, classes) -> use class 1
         values = values[:, :, 1]
 
     mean_abs = np.mean(np.abs(values), axis=0)
+    mean_signed = np.mean(values, axis=0)
     total = float(mean_abs.sum()) + 1e-12
-    shares = mean_abs / total
+    share = mean_abs / total
 
-    df_pie = pd.DataFrame({"Feature": feature_names, "Share": shares})
-    df_pie = df_pie.sort_values("Share", ascending=False).reset_index(drop=True)
+    out = pd.DataFrame({
+        "Feature": feature_names,
+        "mean_abs": mean_abs,
+        "mean_signed": mean_signed,
+        "share": share
+    }).sort_values("mean_abs", ascending=False).reset_index(drop=True)
 
-    top = df_pie.head(top_k).copy()
-    other_share = float(df_pie["Share"].iloc[top_k:].sum()) if len(df_pie) > top_k else 0.0
-    if other_share > 0:
-        top = pd.concat([top, pd.DataFrame([{"Feature": "Other", "Share": other_share}])], ignore_index=True)
+    return out
 
-    if PLOTLY_OK:
-        fig = px.pie(
-            top,
-            names="Feature",
-            values="Share",
-            title=title,
-            hover_data={"Share": True},
-        )
-        fig.update_layout(height=520, margin=dict(l=10, r=10, t=60, b=20), showlegend=False)
-        fig.update_traces(textposition="outside", textinfo="percent+label", textfont_size=14, pull=[0.02]*len(top))
-        st.plotly_chart(fig, use_container_width=True)
+def render_shap_pie_altair(global_df, top_k=8, title="SHAP Feature Impact Share (mean |SHAP|)"):
+    df = global_df[["Feature", "share"]].copy()
+    df = df.sort_values("share", ascending=False).reset_index(drop=True)
+
+    top = df.head(top_k).copy()
+    other = float(df["share"].iloc[top_k:].sum()) if len(df) > top_k else 0.0
+    if other > 0:
+        top = pd.concat([top, pd.DataFrame([{"Feature": "Other", "share": other}])], ignore_index=True)
+
+    top["share_pct"] = top["share"] * 100
+
+    pie = alt.Chart(top).mark_arc(innerRadius=40).encode(
+        theta=alt.Theta("share:Q"),
+        color=alt.Color("Feature:N", legend=None),
+        tooltip=[alt.Tooltip("Feature:N"), alt.Tooltip("share_pct:Q", format=".1f", title="Share (%)")],
+    ).properties(height=420, title=title).interactive()
+
+    # Add labels for larger slices
+    labels = alt.Chart(top[top["share_pct"] >= 6]).mark_text(radius=170, size=12).encode(
+        theta=alt.Theta("share:Q"),
+        text=alt.Text("Feature:N")
+    )
+
+    st.altair_chart(pie + labels, use_container_width=True)
+
+def render_top6_bar(global_df, top_n=6, title="Top 6 drivers (mean |SHAP|)"):
+    top = global_df.head(top_n).copy()
+    top = top.iloc[::-1]  # show biggest at bottom for readability
+
+    if ALTAIR_OK:
+        bar = alt.Chart(top).mark_bar().encode(
+            x=alt.X("mean_abs:Q", title="mean(|SHAP|)"),
+            y=alt.Y("Feature:N", sort=None, title=None),
+            tooltip=[
+                alt.Tooltip("Feature:N"),
+                alt.Tooltip("mean_abs:Q", format=".6f", title="mean(|SHAP|)"),
+                alt.Tooltip("mean_signed:Q", format=".6f", title="mean(SHAP)"),
+                alt.Tooltip("share:Q", format=".3%", title="share"),
+            ],
+        ).properties(height=260, title=title).interactive()
+        st.altair_chart(bar, use_container_width=True)
     else:
-        plt.figure(figsize=(7, 6))
-        plt.pie(
-            top["Share"].tolist(),
-            labels=top["Feature"].tolist(),
-            autopct=lambda p: f"{p:.1f}%" if p >= 4 else "",
-            startangle=90
-        )
-        plt.title(title)
-        st.pyplot(plt.gcf(), clear_figure=True)
-        st.info("For an interactive pie chart, add `plotly` to requirements.txt and redeploy.")
+        st.bar_chart(top.set_index("Feature")["mean_abs"])
 
-    return df_pie
+def direction_arrow(mean_signed: float) -> str:
+    # positive -> increases risk, negative -> decreases risk
+    if mean_signed > 0:
+        return "↑ increases risk (on average)"
+    if mean_signed < 0:
+        return "↓ decreases risk (on average)"
+    return "≈ neutral (on average)"
 
 # ======================================================================
 # LOAD EVERYTHING
@@ -530,7 +568,6 @@ risk_df = df_target[
     (df_target["year"] <= to_year)
 ].copy()
 
-# align scaled rows with risk_df indices (df_target is reset_index'd)
 risk_scaled = X_full_scaled[risk_df.index.to_numpy()]
 risk_df["crisis_prob"] = selected_model.predict_proba(risk_scaled)[:, 1]
 
@@ -547,7 +584,7 @@ macro_df = macro[
 ].copy()
 
 # ======================================================================
-# TABS (no upload tab)
+# TABS
 # ======================================================================
 
 tab1, tab2, tab3, tab4 = st.tabs([
@@ -558,7 +595,7 @@ tab1, tab2, tab3, tab4 = st.tabs([
 ])
 
 # -----------------------------------------------------------------------------
-# TAB 1: Crisis risk + GDP + SHAP pie + explanation
+# TAB 1: Crisis risk + GDP + SHAP pie + Top-6 SHAP + explanations
 with tab1:
     st.header("Crisis risk over time", divider="gray")
 
@@ -622,7 +659,8 @@ with tab1:
                         x_col="year",
                         y_col="gdp",
                         color_col="country",
-                        title="GDP (JST)"
+                        title="GDP (JST)",
+                        y_format=",.0f"
                     ),
                     use_container_width=True
                 )
@@ -651,37 +689,60 @@ with tab1:
             st.info("House price data not available for selected range.")
 
     with right:
-        st.markdown("### 🧠 SHAP Feature Importance (Pie)")
-        st.caption("Pie shows **mean(|SHAP|)** share across sampled test rows (global importance).")
+        st.markdown("### 🧠 SHAP Feature Importance")
+        st.caption("SHAP allocates the prediction (relative to a baseline) across features. Larger **|SHAP|** = bigger influence.")
 
+        # Compute SHAP once and reuse (pie + top6 + explanations)
         try:
-            shap_pie_df = shap_pie(
+            global_shap = compute_shap_global(
                 selected_model=selected_model,
                 Xs_test=Xs_test,
                 feature_names=all_features,
-                sample_n=shap_sample_n,
-                top_k=8,
-                title="SHAP Feature Impact Share (mean |SHAP|)"
+                sample_n=shap_sample_n
             )
 
+            # --- Pie chart (interactive if Altair available)
+            st.markdown("#### Pie: global impact share (mean |SHAP|)")
+            st.caption("This pie shows **share of total mean(|SHAP|)** across sampled test rows (global importance).")
+            if ALTAIR_OK:
+                render_shap_pie_altair(global_shap, top_k=8, title="SHAP Feature Impact Share (mean |SHAP|)")
+            else:
+                # fallback pie
+                top = global_shap.head(8).copy()
+                other = float(global_shap["share"].iloc[8:].sum()) if len(global_shap) > 8 else 0.0
+                if other > 0:
+                    top = pd.concat([top, pd.DataFrame([{"Feature": "Other", "mean_abs": np.nan, "mean_signed": 0.0, "share": other}])], ignore_index=True)
+                plt.figure(figsize=(7, 6))
+                plt.pie(top["share"], labels=top["Feature"], autopct=lambda p: f"{p:.1f}%" if p >= 4 else "", startangle=90)
+                plt.title("SHAP Feature Impact Share (mean |SHAP|)")
+                st.pyplot(plt.gcf(), clear_figure=True)
+                st.info("Install `altair` for an interactive pie chart.")
+
+            st.write("")
+            st.markdown("#### Top 6 SHAP drivers (graph + explanation)")
+            render_top6_bar(global_shap, top_n=6, title="Top 6 drivers (mean |SHAP|)")
+
+            # Explanation right under the chart (as you asked)
+            top6 = global_shap.head(6).copy()
+            st.markdown("**What the top 6 represent**")
             st.markdown(
-                """
-**What SHAP values are**
-- SHAP (SHapley Additive exPlanations) assigns each feature a contribution to a prediction relative to a baseline.
-- **Positive SHAP** pushes predicted crisis risk **up**; **negative SHAP** pushes it **down**.
-- Larger **|SHAP|** means the feature has a stronger influence.
-
-**What this pie represents**
-- This is **global importance**: average absolute contribution across many observations.
-- It shows *how much* each feature matters overall (**share of total influence**), not the direction.
-"""
+                "- The bar chart ranks features by **mean(|SHAP|)** across the sampled rows.\n"
+                "- It answers: *which variables influence the model the most overall?*\n"
+                "- The direction note uses **mean(SHAP)** (average sign)."
             )
 
-            with st.expander("Show SHAP importance table (top 20)"):
-                st.dataframe(
-                    shap_pie_df.assign(Share_pct=shap_pie_df["Share"] * 100).head(20),
-                    use_container_width=True
+            for _, row in top6.iterrows():
+                feat = str(row["Feature"])
+                dir_note = direction_arrow(float(row["mean_signed"]))
+                st.markdown(
+                    f"- **{feat}** — {dir_note}.  \n"
+                    f"  *Meaning:* {explain_feature(feat)}"
                 )
+
+            with st.expander("Show SHAP importance table (top 25)"):
+                tmp = global_shap.copy()
+                tmp["share_pct"] = tmp["share"] * 100
+                st.dataframe(tmp.head(25), use_container_width=True)
 
         except Exception:
             st.warning("SHAP could not be computed for this model. Try Gradient Boosting / Random Forest, or reduce SHAP sample size.")
@@ -724,7 +785,7 @@ SHAP explains predictions by distributing the difference between the prediction 
 
 - **Positive SHAP** increases predicted crisis risk.
 - **Negative SHAP** decreases predicted crisis risk.
-- **Mean absolute SHAP** gives global importance (what the pie summarises).
+- **Mean absolute SHAP** gives global importance (what the Tab 1 pie and Top-6 chart summarise).
 """
     )
 
