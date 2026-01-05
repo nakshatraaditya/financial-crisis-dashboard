@@ -8,13 +8,14 @@
 #
 #  Current updates:
 #   ✅ GDP chart uses JSTdatasetR6.xlsx (NO external gdp_data.csv needed)
-#   ✅ SHAP pie chart shown on FIRST page
-#   ✅ Pie chart visibility fixed (no legend squeeze, bigger chart, outside labels, dark theme)
-#   ✅ SHAP explainability text placed RIGHT UNDER the pie chart
+#   ✅ SHAP pie chart shown on FIRST page (interactive if Plotly installed)
+#   ✅ Pie chart visibility fixed + SHAP explanation under the pie
 #   ✅ results_df Arrow-safe (no sklearn objects inside dataframe)
 #
-#  Note:
-#   - Interactive pie requires plotly. If not installed, matplotlib fallback is used.
+#  NEW changes (requested):
+#   ✅ Consistent RGB color mapping for USA/UK/Canada across ALL country charts
+#      (implemented using Altair so we can control colors)
+#   ✅ Crisis summary shown as PERCENTAGE (and delta vs threshold in percentage points)
 # ======================================================================
 
 import streamlit as st
@@ -30,6 +31,13 @@ try:
     PLOTLY_OK = True
 except Exception:
     PLOTLY_OK = False
+
+# Altair for RGB-controlled charts (recommended for consistent colors)
+try:
+    import altair as alt
+    ALTAIR_OK = True
+except Exception:
+    ALTAIR_OK = False
 
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
@@ -63,6 +71,16 @@ APP_DIR = Path(__file__).parent
 JST_XLSX = APP_DIR / "JSTdatasetR6.xlsx"
 
 # -----------------------------------------------------------------------------
+# RGB COLOR MAP (consistent across all charts)
+# You can change these RGBs to match your dissertation theme.
+COUNTRY_ORDER = ["USA", "UK", "Canada"]
+COUNTRY_RGB = {
+    "USA": "rgb(255, 99, 71)",     # Tomato
+    "UK": "rgb(100, 149, 237)",    # Cornflower Blue
+    "Canada": "rgb(60, 179, 113)", # Medium Sea Green
+}
+
+# -----------------------------------------------------------------------------
 # HEADER
 """
 # 📉 Financial Crisis Early Warning System (EWS)
@@ -84,6 +102,52 @@ with st.sidebar:
         st.cache_data.clear()
         st.cache_resource.clear()
         st.rerun()
+
+# ======================================================================
+# Helper: Altair line chart with fixed RGB by country
+# ======================================================================
+
+def altair_line_chart(df: pd.DataFrame, x_col: str, y_col: str, color_col: str, title: str = ""):
+    """
+    Draws a line chart with consistent RGB colors by country (Altair).
+    Falls back to st.line_chart if Altair isn't available.
+    """
+    if df is None or df.empty:
+        st.info("No data to plot.")
+        return
+
+    if not ALTAIR_OK:
+        # Fallback (no custom colors)
+        st.line_chart(df, x=x_col, y=y_col, color=color_col)
+        return
+
+    domain = [c for c in COUNTRY_ORDER if c in df[color_col].unique()]
+    # Add any extra categories (e.g., uploaded unexpected labels) deterministically
+    extra = [c for c in sorted(df[color_col].unique()) if c not in domain]
+    domain = domain + extra
+
+    # Colors for known + fallback for unknown
+    range_colors = [COUNTRY_RGB.get(c, "rgb(180,180,180)") for c in domain]
+
+    chart = (
+        alt.Chart(df)
+        .mark_line(point=False)
+        .encode(
+            x=alt.X(f"{x_col}:Q", title=x_col),
+            y=alt.Y(f"{y_col}:Q", title=y_col),
+            color=alt.Color(
+                f"{color_col}:N",
+                scale=alt.Scale(domain=domain, range=range_colors),
+                legend=alt.Legend(title=color_col),
+            ),
+            tooltip=[alt.Tooltip(f"{color_col}:N"), alt.Tooltip(f"{x_col}:Q"), alt.Tooltip(f"{y_col}:Q", format=".4f")],
+        )
+        .properties(height=320, title=title)
+        .interactive()
+    )
+
+    st.altair_chart(chart, use_container_width=True)
+
 
 # ======================================================================
 # 1) JST MACRO DATA (GDP + House prices) FOR CHARTS
@@ -547,32 +611,43 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
 ])
 
 # -----------------------------------------------------------------------------
-# TAB 1: Crisis Risk + JST GDP + Real House Prices + SHAP pie + explanation under pie
+# TAB 1: Crisis Risk + JST GDP + Real House Prices + SHAP pie + explanation
 with tab1:
     st.header("Crisis risk over time", divider="gray")
 
     if risk_df.empty:
         st.warning("No data for the selected filters.")
     else:
-        st.line_chart(risk_df, x="year", y="crisis_prob", color="country")
+        # RGB-controlled chart
+        altair_line_chart(
+            risk_df,
+            x_col="year",
+            y_col="crisis_prob",
+            color_col="country",
+            title="Predicted crisis probability over time"
+        )
 
         st.write("")
-        st.subheader(f"Risk summary ({to_year})", divider="gray")
+        st.subheader(f"Crisis summary ({to_year})", divider="gray")
 
         latest = risk_df[risk_df["year"] == to_year]
         cols = st.columns(3)
 
+        # ✅ Summary in PERCENTAGE
         for i, c in enumerate(risk_countries):
             with cols[i % 3]:
                 val = latest[latest["country"] == c]["crisis_prob"].mean()
                 if pd.isna(val):
                     st.metric(label=f"{c} risk", value="n/a")
                 else:
+                    val_pct = val * 100
+                    thr_pct = threshold * 100
+                    delta_pp = val_pct - thr_pct
                     st.metric(
-                        label=f"{c} risk",
-                        value=f"{val:.2f}",
-                        delta="HIGH" if val >= threshold else "LOW",
-                        delta_color="inverse",
+                        label=f"{c} crisis risk",
+                        value=f"{val_pct:.1f}%",
+                        delta=f"{delta_pp:+.1f} pp vs threshold",
+                        delta_color="inverse" if val >= threshold else "normal",
                     )
 
         if show_crisis_years:
@@ -586,7 +661,7 @@ with tab1:
 
         left, right = st.columns(2)
 
-        # --- LEFT: GDP & House prices from JSTdatasetR6.xlsx ---
+        # --- LEFT: GDP & House prices from JSTdatasetR6.xlsx (RGB-controlled) ---
         with left:
             st.markdown("### 🌍 GDP (JST variable)")
             macro_filtered = macro_df[
@@ -596,19 +671,31 @@ with tab1:
             ].copy()
 
             if "gdp" in macro_filtered.columns:
-                st.line_chart(macro_filtered, x="year", y="gdp", color="country")
-                st.caption("This chart uses the **JST `gdp` variable** (check JST codebook for exact definition/units).")
+                altair_line_chart(
+                    macro_filtered,
+                    x_col="year",
+                    y_col="gdp",
+                    color_col="country",
+                    title="GDP (JST variable)"
+                )
+                st.caption("This uses the **JST `gdp` variable** (check JST codebook for exact definition/units).")
             else:
                 st.warning("Column `gdp` not found in JSTdatasetR6.xlsx")
 
             st.write("")
             st.markdown("### 🏠 Real house prices (hpnom / cpi)")
             if "house_price_real" in macro_filtered.columns:
-                st.line_chart(macro_filtered, x="year", y="house_price_real", color="country")
+                altair_line_chart(
+                    macro_filtered,
+                    x_col="year",
+                    y_col="house_price_real",
+                    color_col="country",
+                    title="Real House Prices (hpnom / cpi)"
+                )
             else:
                 st.info("House price columns not available to compute real house prices.")
 
-        # --- RIGHT: SHAP pie (visibility fixed) + SHAP explanation under the pie ---
+        # --- RIGHT: SHAP pie (visibility fixed) + explanation under pie ---
         with right:
             st.markdown("### 🧠 SHAP Explainability")
             st.caption("Pie uses **mean(|SHAP|)** across sampled test rows (share of total influence).")
@@ -641,8 +728,6 @@ with tab1:
                         hover_data={"Share_%": True, "Share": True},
                         title="SHAP Feature Impact Share (mean |SHAP|)"
                     )
-
-                    # Fix visibility: no legend squeeze, bigger plot, dark theme, outside labels
                     fig.update_layout(
                         template="plotly_dark",
                         height=520,
@@ -655,9 +740,7 @@ with tab1:
                         textfont_size=14,
                         pull=[0.02] * len(top),
                     )
-
                     st.plotly_chart(fig, use_container_width=True)
-
                 else:
                     labels = top["Feature"].tolist()
                     sizes = top["Share"].tolist()
@@ -672,21 +755,19 @@ with tab1:
                     st.pyplot(plt.gcf(), clear_figure=True)
                     st.info("Install `plotly` to make the pie chart interactive (add `plotly` to requirements.txt).")
 
-                # SHAP explainability UNDER the pie chart
                 st.markdown(
                     """
 **What SHAP values represent**
 
-- SHAP (SHapley Additive exPlanations) decomposes a model prediction into **feature contributions** around a baseline.  
-- A **positive SHAP value** means that feature pushes the prediction **towards crisis (higher risk)**.  
-- A **negative SHAP value** means it pushes the prediction **away from crisis (lower risk)**.  
-- Larger **|SHAP|** means the feature has **stronger influence** on the model output.
+- SHAP (SHapley Additive exPlanations) decomposes a model prediction into **feature contributions** relative to a baseline.  
+- **Positive SHAP** → pushes predicted crisis risk **up**.  
+- **Negative SHAP** → pushes predicted crisis risk **down**.  
+- Larger **|SHAP|** → stronger influence.
 
 **What this pie chart shows**
 
-This pie chart uses **mean absolute SHAP** (mean(|SHAP|)) over many test observations.  
-So, it reflects **global feature importance (share of total influence)**, not the direction of effect.  
-For direction and dispersion, use the **SHAP dot/bar plots** in the SHAP tab.
+This pie chart uses **mean(|SHAP|)** across many test observations to represent **global importance** (share of total influence).  
+It shows *how much* a feature matters overall, not whether it increases/decreases risk on average.
 """
                 )
 
@@ -745,11 +826,14 @@ with tab3:
 
         st.write("")
         st.subheader("Uploaded risk over time", divider="gray")
-        st.line_chart(
+
+        # Use RGB mapping if uploaded has same country labels; otherwise unknowns are grey
+        altair_line_chart(
             uploaded_preds.sort_values(["country", "year"]),
-            x="year",
-            y="predicted_prob",
-            color="country",
+            x_col="year",
+            y_col="predicted_prob",
+            color_col="country",
+            title="Uploaded predicted crisis probability over time"
         )
 
         csv_bytes = uploaded_preds.to_csv(index=False).encode("utf-8")
@@ -779,7 +863,7 @@ For a single observation:
 - **Negative SHAP** → pushes prediction **away from crisis (lower risk)**
 - Larger **|SHAP|** → stronger effect
 
-**Note:** The pie chart uses **mean absolute SHAP** (importance share), which shows *how much* a feature matters overall, not direction.
+**Note:** The pie chart uses **mean(|SHAP|)** (importance share), which shows *how much* a feature matters overall, not direction.
 """
     )
 
