@@ -6,12 +6,15 @@
 #   - Multi-model validation + best model selection
 #   - SHAP explainability
 #
-#  Updates (requested):
+#  Current updates:
 #   ✅ GDP chart uses JSTdatasetR6.xlsx (NO external gdp_data.csv needed)
-#   ✅ SHAP pie chart shown on FIRST page (interactive if Plotly installed,
-#      otherwise falls back to Matplotlib)
-#   ✅ GDP defaults to USA/UK/Canada (and respects country filter)
-#   ✅ results_df Arrow-safe (no sklearn objects)
+#   ✅ SHAP pie chart shown on FIRST page
+#   ✅ Pie chart visibility fixed (no legend squeeze, bigger chart, outside labels, dark theme)
+#   ✅ SHAP explainability text placed RIGHT UNDER the pie chart
+#   ✅ results_df Arrow-safe (no sklearn objects inside dataframe)
+#
+#  Note:
+#   - Interactive pie requires plotly. If not installed, matplotlib fallback is used.
 # ======================================================================
 
 import streamlit as st
@@ -544,7 +547,7 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
 ])
 
 # -----------------------------------------------------------------------------
-# TAB 1: Crisis Risk + JST GDP + Real House Prices + SHAP pie
+# TAB 1: Crisis Risk + JST GDP + Real House Prices + SHAP pie + explanation under pie
 with tab1:
     st.header("Crisis risk over time", divider="gray")
 
@@ -605,12 +608,12 @@ with tab1:
             else:
                 st.info("House price columns not available to compute real house prices.")
 
-        # --- RIGHT: SHAP pie (interactive if Plotly installed) ---
+        # --- RIGHT: SHAP pie (visibility fixed) + SHAP explanation under the pie ---
         with right:
-            st.markdown("### 🧠 SHAP pie (feature impact share)")
+            st.markdown("### 🧠 SHAP Explainability")
             st.caption("Pie uses **mean(|SHAP|)** across sampled test rows (share of total influence).")
 
-            top_k = 10
+            top_k = 8  # fewer slices => clearer pie
             try:
                 shap_pie_df = get_shap_pie_data(
                     model_key=model_choice,
@@ -623,41 +626,81 @@ with tab1:
                 top = shap_pie_df.head(top_k).copy()
                 other_share = float(shap_pie_df["Share"].iloc[top_k:].sum()) if len(shap_pie_df) > top_k else 0.0
                 if other_share > 0:
-                    top = pd.concat([top, pd.DataFrame([{"Feature": "Other", "Share": other_share}])], ignore_index=True)
+                    top = pd.concat(
+                        [top, pd.DataFrame([{"Feature": "Other", "Share": other_share}])],
+                        ignore_index=True
+                    )
 
-                top["Share_%"] = top["Share"] * 100
+                top["Share_%"] = (top["Share"] * 100).round(2)
 
                 if PLOTLY_OK:
                     fig = px.pie(
                         top,
                         names="Feature",
                         values="Share",
-                        hover_data=["Share_%"],
+                        hover_data={"Share_%": True, "Share": True},
                         title="SHAP Feature Impact Share (mean |SHAP|)"
                     )
-                    fig.update_traces(textposition="inside", textinfo="percent+label")
+
+                    # Fix visibility: no legend squeeze, bigger plot, dark theme, outside labels
+                    fig.update_layout(
+                        template="plotly_dark",
+                        height=520,
+                        margin=dict(l=10, r=10, t=60, b=20),
+                        showlegend=False,
+                    )
+                    fig.update_traces(
+                        textposition="outside",
+                        textinfo="percent+label",
+                        textfont_size=14,
+                        pull=[0.02] * len(top),
+                    )
+
                     st.plotly_chart(fig, use_container_width=True)
+
                 else:
-                    # fallback to matplotlib
                     labels = top["Feature"].tolist()
                     sizes = top["Share"].tolist()
-                    plt.figure()
+                    plt.figure(figsize=(7, 6))
                     plt.pie(
                         sizes,
                         labels=labels,
-                        autopct=lambda p: f"{p:.1f}%" if p >= 4 else ""
+                        autopct=lambda p: f"{p:.1f}%" if p >= 4 else "",
+                        startangle=90
                     )
                     plt.title("SHAP Feature Impact Share (mean |SHAP|)")
                     st.pyplot(plt.gcf(), clear_figure=True)
-                    st.info("Install `plotly` to make the pie chart interactive (add it to requirements.txt).")
+                    st.info("Install `plotly` to make the pie chart interactive (add `plotly` to requirements.txt).")
 
-                st.caption(
-                    "Bigger slice = feature has greater overall influence on predicted crisis risk. "
-                    "Pie shows magnitude share, not direction (↑/↓)."
+                # SHAP explainability UNDER the pie chart
+                st.markdown(
+                    """
+**What SHAP values represent**
+
+- SHAP (SHapley Additive exPlanations) decomposes a model prediction into **feature contributions** around a baseline.  
+- A **positive SHAP value** means that feature pushes the prediction **towards crisis (higher risk)**.  
+- A **negative SHAP value** means it pushes the prediction **away from crisis (lower risk)**.  
+- Larger **|SHAP|** means the feature has **stronger influence** on the model output.
+
+**What this pie chart shows**
+
+This pie chart uses **mean absolute SHAP** (mean(|SHAP|)) over many test observations.  
+So, it reflects **global feature importance (share of total influence)**, not the direction of effect.  
+For direction and dispersion, use the **SHAP dot/bar plots** in the SHAP tab.
+"""
                 )
 
+                with st.expander("Show SHAP importance table (top 20)"):
+                    st.dataframe(
+                        shap_pie_df.assign(Share_pct=shap_pie_df["Share"] * 100).head(20),
+                        use_container_width=True
+                    )
+
             except Exception:
-                st.warning("SHAP pie could not be computed for this model. Try Gradient Boosting/Random Forest or reduce SHAP sample size.")
+                st.warning(
+                    "SHAP could not be computed for this model. "
+                    "Try Gradient Boosting / Random Forest or reduce SHAP sample size."
+                )
 
 # -----------------------------------------------------------------------------
 # TAB 2: Model Results
@@ -736,7 +779,7 @@ For a single observation:
 - **Negative SHAP** → pushes prediction **away from crisis (lower risk)**
 - Larger **|SHAP|** → stronger effect
 
-**Note:** Pie chart uses **mean absolute SHAP** (importance share), which shows *how much* a feature matters overall, not direction.
+**Note:** The pie chart uses **mean absolute SHAP** (importance share), which shows *how much* a feature matters overall, not direction.
 """
     )
 
