@@ -1,38 +1,41 @@
 # ======================================================================
 #  FINANCIAL CRISIS EARLY WARNING SYSTEM – STREAMLIT DASHBOARD (FULL)
-#  (UPLOAD REMOVED COMPLETELY)
+#  + LLM POWERED CHATBOT "POPUP" (st.popover) that stays available across tabs
 #
-#  ✅ No sidebar upload / no upload tab
-#  ✅ Interactive RGB country charts (Altair if available; st.line_chart fallback)
-#  ✅ Crisis Risk tab includes:
-#       - Risk timeline with crisis-year shading (JST crisisJST)
-#       - Crisis summary as PERCENTAGE
-#       - GDP + Real House Price charts (from JST)
-#       - SHAP pie chart + explanation
-#       - NEW: Top-6 SHAP bar chart + explanations (Tab 1)
-#  ✅ Model Results tab (Arrow-safe results_df)
-#  ✅ SHAP detailed tab (summary plot)
-#  ✅ Data Explorer tab
+#  ✅ No upload UI anywhere
+#  ✅ Chatbot opens as a popup (popover) and uses OpenAI Chat Completions API
+#  ✅ Chat remembers conversation in st.session_state
+#  ✅ Chat gets LIVE dashboard context (model, threshold, metrics, top SHAP)
+#
+#  IMPORTANT:
+#  - Put JSTdatasetR6.xlsx next to this app.py
+#  - Add OPENAI_API_KEY in Streamlit Secrets OR environment variable
 # ======================================================================
+
+import os
+import json
+import math
+from pathlib import Path
 
 import streamlit as st
 import pandas as pd
 import numpy as np
-import math
-from pathlib import Path
 import matplotlib.pyplot as plt
 
-# Optional Altair (interactive + RGB + shading + pie)
+# Optional Altair for interactive RGB + shading + interactive pie
 try:
     import altair as alt
     ALTAIR_OK = True
 except Exception:
     ALTAIR_OK = False
 
+import requests
+
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.svm import SVC
 from sklearn.neural_network import MLPClassifier
+from sklearn.preprocessing import StandardScaler
 
 from sklearn.metrics import (
     roc_auc_score,
@@ -43,7 +46,6 @@ from sklearn.metrics import (
     confusion_matrix,
 )
 
-from sklearn.preprocessing import StandardScaler
 import shap
 import warnings
 warnings.filterwarnings("ignore")
@@ -88,23 +90,30 @@ def build_color_scale(categories):
     return domain, range_colors
 
 # -----------------------------------------------------------------------------
-# SHAP feature explanations (used for Top-6 explanation in Tab 1)
+# SHAP feature explanations
 FEATURE_EXPLANATIONS = {
-    "housing_bubble": "Deviation of real house prices from a 10-year rolling trend (proxy for housing overvaluation).",
-    "credit_growth": "Growth in real bank credit (tloans/cpi). Rapid increases often signal overheating/leverage build-up.",
-    "banking_fragility": "Composite fragility index from expanding z-scores of noncore funding, LTD, and leverage risk.",
-    "sovereign_spread": "Long-term rate minus USA long-term rate (proxy for risk premium / differential vs US benchmark).",
-    "yield_curve": "Term spread (ltrate − stir). Flattening/inversion can reflect tighter conditions and recession risk.",
-    "money_expansion": "Change in money-to-GDP ratio (proxy for liquidity expansion / credit conditions).",
-    "ca_gdp": "Current account balance scaled by GDP (external imbalances can amplify crisis risk).",
+    "housing_bubble": "Deviation of real house prices from a 10-year rolling trend (housing overvaluation proxy).",
+    "credit_growth": "Growth in real bank credit (tloans/cpi). Rapid increases can signal overheating/leverage.",
+    "banking_fragility": "Composite fragility index from noncore funding, LTD, and leverage-risk z-scores.",
+    "sovereign_spread": "Long-term rate minus USA long-term rate (risk premium differential vs US benchmark).",
+    "yield_curve": "Term spread (ltrate − stir). Flattening/inversion often reflects tighter conditions.",
+    "money_expansion": "Change in money-to-GDP ratio (liquidity/credit conditions proxy).",
+    "ca_gdp": "Current account balance scaled by GDP (external imbalance proxy).",
 }
 
 def explain_feature(name: str) -> str:
     if name.endswith("_missing"):
         base = name.replace("_missing", "")
-        base_desc = FEATURE_EXPLANATIONS.get(base, "Base feature missingness indicator.")
-        return f"Missing-value flag for `{base}` (1 if missing, else 0). Captures information in data gaps. Base meaning: {base_desc}"
+        base_desc = FEATURE_EXPLANATIONS.get(base, "Base feature meaning.")
+        return f"Missing-value flag for `{base}` (1 if missing, else 0). Base meaning: {base_desc}"
     return FEATURE_EXPLANATIONS.get(name, "Engineered macro-financial indicator used by the model.")
+
+def direction_arrow(mean_signed: float) -> str:
+    if mean_signed > 0:
+        return "↑ increases risk (on average)"
+    if mean_signed < 0:
+        return "↓ decreases risk (on average)"
+    return "≈ neutral (on average)"
 
 # -----------------------------------------------------------------------------
 # HEADER
@@ -116,6 +125,9 @@ with st.sidebar:
     if st.button("Clear cache & rerun"):
         st.cache_data.clear()
         st.cache_resource.clear()
+        st.session_state.pop("chat_messages", None)
+        st.session_state.pop("chat_last_error", None)
+        st.session_state.pop("chat_api_key", None)
         st.rerun()
 
 # ======================================================================
@@ -133,7 +145,6 @@ def load_data(jst_path: str):
 def engineer_features(df):
     df = df.copy()
 
-    # ensure crisisJST exists
     if "crisisJST" not in df.columns:
         df["crisisJST"] = 0
 
@@ -167,7 +178,6 @@ def engineer_features(df):
 
     df["yield_curve"] = df["ltrate"] - df["stir"]
 
-    # Sovereign spread vs USA long rate (works for USA/UK/Canada view)
     us_ltrate = (
         df[df["country"] == "USA"]
         .drop_duplicates("year")
@@ -196,20 +206,16 @@ def engineer_features(df):
 def clean_data(df, base_features):
     df = df.copy()
 
-    # War periods removed
     df = df[~df["year"].between(1914, 1918)]
     df = df[~df["year"].between(1939, 1945)]
 
-    # Missing flags
     for col in base_features:
         df[f"{col}_missing"] = df[col].isna().astype(int)
 
-    # Causal fill within country
     df[base_features] = df.groupby("country")[base_features].transform(
         lambda x: x.ffill(limit=3).bfill(limit=3)
     )
 
-    # Median fallback within country
     df[base_features] = df.groupby("country")[base_features].transform(
         lambda x: x.fillna(x.median())
     )
@@ -303,7 +309,6 @@ def train_pipeline(jst_path: str):
     missing_features = [f"{f}_missing" for f in base_features]
     all_features = base_features + missing_features
 
-    # Train/Val/Test time split
     train = df_target[df_target["year"] < 1970]
     val   = df_target[(df_target["year"] >= 1970) & (df_target["year"] < 1990)]
     test  = df_target[df_target["year"] >= 1990]
@@ -316,7 +321,6 @@ def train_pipeline(jst_path: str):
     y_val   = val["target"]
     y_test  = test["target"]
 
-    # Proper scaling: continuous only
     scaler = StandardScaler()
     Xs_train_cont = scaler.fit_transform(X_train[base_features])
     Xs_val_cont   = scaler.transform(X_val[base_features])
@@ -326,7 +330,6 @@ def train_pipeline(jst_path: str):
     Xs_val   = np.hstack([Xs_val_cont,   X_val[missing_features].values])
     Xs_test  = np.hstack([Xs_test_cont,  X_test[missing_features].values])
 
-    # Train & evaluate
     results = []
     fitted_models = {}
 
@@ -417,12 +420,6 @@ def altair_risk_with_crisis_bands(risk_df, crisis_df, title, threshold=None):
     return alt.layer(*layers).properties(height=320, title=title).interactive()
 
 def compute_shap_global(selected_model, Xs_test, feature_names, sample_n=150):
-    """
-    Returns a dataframe with:
-      - mean_abs (mean |SHAP|)
-      - mean_signed (mean SHAP)
-      - share (mean_abs / sum(mean_abs))
-    """
     X_test_shap = pd.DataFrame(Xs_test, columns=feature_names)
     Xsamp = X_test_shap.sample(n=min(sample_n, len(X_test_shap)), random_state=42)
 
@@ -464,7 +461,6 @@ def render_shap_pie_altair(global_df, top_k=8, title="SHAP Feature Impact Share 
         tooltip=[alt.Tooltip("Feature:N"), alt.Tooltip("share_pct:Q", format=".1f", title="Share (%)")],
     ).properties(height=420, title=title).interactive()
 
-    # Add labels for larger slices
     labels = alt.Chart(top[top["share_pct"] >= 6]).mark_text(radius=170, size=12).encode(
         theta=alt.Theta("share:Q"),
         text=alt.Text("Feature:N")
@@ -474,8 +470,7 @@ def render_shap_pie_altair(global_df, top_k=8, title="SHAP Feature Impact Share 
 
 def render_top6_bar(global_df, top_n=6, title="Top 6 drivers (mean |SHAP|)"):
     top = global_df.head(top_n).copy()
-    top = top.iloc[::-1]  # show biggest at bottom for readability
-
+    top = top.iloc[::-1]
     if ALTAIR_OK:
         bar = alt.Chart(top).mark_bar().encode(
             x=alt.X("mean_abs:Q", title="mean(|SHAP|)"),
@@ -490,14 +485,6 @@ def render_top6_bar(global_df, top_n=6, title="Top 6 drivers (mean |SHAP|)"):
         st.altair_chart(bar, use_container_width=True)
     else:
         st.bar_chart(top.set_index("Feature")["mean_abs"])
-
-def direction_arrow(mean_signed: float) -> str:
-    # positive -> increases risk, negative -> decreases risk
-    if mean_signed > 0:
-        return "↑ increases risk (on average)"
-    if mean_signed < 0:
-        return "↓ decreases risk (on average)"
-    return "≈ neutral (on average)"
 
 # ======================================================================
 # LOAD EVERYTHING
@@ -524,7 +511,7 @@ X_full_scaled = bundle["X_full_scaled"]
 test_probs_by_model = bundle["test_probs_by_model"]
 
 # ======================================================================
-# SIDEBAR CONTROLS (NO UPLOAD)
+# SIDEBAR CONTROLS
 # ======================================================================
 
 st.sidebar.header("🎛️ Model & Filters")
@@ -584,6 +571,185 @@ macro_df = macro[
 ].copy()
 
 # ======================================================================
+# CHATBOT (POPOVER POPUP) — appears above tabs and remains available
+# ======================================================================
+
+def get_openai_key() -> str | None:
+    # Priority:
+    # 1) st.session_state (user entered during runtime)
+    # 2) Streamlit Secrets
+    # 3) Environment variable
+    if st.session_state.get("chat_api_key"):
+        return st.session_state["chat_api_key"]
+    if "OPENAI_API_KEY" in st.secrets:
+        return str(st.secrets["OPENAI_API_KEY"]).strip()
+    env_key = os.getenv("OPENAI_API_KEY", "").strip()
+    return env_key if env_key else None
+
+def build_dashboard_context_text() -> str:
+    # Metrics for current selection
+    probs = test_probs_by_model[model_choice]
+    preds = (probs >= threshold).astype(int)
+
+    roc = roc_auc_score(y_test, probs)
+    pr  = average_precision_score(y_test, probs)
+    prec = precision_score(y_test, preds, zero_division=0)
+    rec  = recall_score(y_test, preds, zero_division=0)
+    f1   = f1_score(y_test, preds, zero_division=0)
+
+    # Top SHAP (global)
+    top_shap = None
+    try:
+        g = compute_shap_global(selected_model, Xs_test, all_features, sample_n=min(150, shap_sample_n))
+        top_shap = g.head(6)[["Feature", "share", "mean_signed"]].copy()
+    except Exception:
+        top_shap = None
+
+    crisis_counts = crisis_years_df.groupby("country")["year"].count().to_dict() if not crisis_years_df.empty else {}
+
+    ctx = []
+    ctx.append("DASHBOARD CONTEXT (live):")
+    ctx.append(f"- Selected model: {model_choice}")
+    ctx.append(f"- Risk threshold: {threshold:.2f}")
+    ctx.append(f"- Countries selected: {', '.join(risk_countries) if risk_countries else '(none)'}")
+    ctx.append(f"- Year range selected: {from_year} to {to_year}")
+    ctx.append(f"- Test metrics (1990+): ROC-AUC={roc:.3f}, PR-AUC={pr:.3f}, Precision={prec:.3f}, Recall={rec:.3f}, F1={f1:.3f}")
+    if crisis_counts:
+        ctx.append(f"- Crisis years count in current window: {crisis_counts}")
+    else:
+        ctx.append("- Crisis years count in current window: none or not in selection")
+    if top_shap is not None:
+        rows = []
+        for _, r in top_shap.iterrows():
+            direction = "increases risk" if float(r["mean_signed"]) > 0 else "decreases risk" if float(r["mean_signed"]) < 0 else "neutral"
+            rows.append(f"{r['Feature']} (share={float(r['share'])*100:.1f}%, avg sign={direction})")
+        ctx.append("- Top SHAP drivers (global): " + "; ".join(rows))
+    else:
+        ctx.append("- Top SHAP drivers (global): unavailable (SHAP failed for this model).")
+
+    ctx.append("Allowed topics: interpreting graphs, metrics, SHAP, crisis years, GDP/house prices, threshold effects, comparing models.")
+    ctx.append("If asked something outside this dashboard/data, say so and suggest what to check.")
+    return "\n".join(ctx)
+
+def openai_chat_completion(api_key: str, messages: list[dict], model: str = "gpt-4o-mini") -> str:
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": 0.2,
+    }
+    r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=60)
+    r.raise_for_status()
+    data = r.json()
+    return data["choices"][0]["message"]["content"]
+
+def init_chat():
+    if "chat_messages" not in st.session_state:
+        st.session_state["chat_messages"] = [
+            {
+                "role": "assistant",
+                "content": "Hi! Ask me anything about this dashboard (metrics, SHAP, crisis years, GDP/house prices, threshold effects)."
+            }
+        ]
+
+init_chat()
+
+# Place popover top-right-ish (above tabs)
+top_row_left, top_row_right = st.columns([0.78, 0.22], gap="small")
+with top_row_left:
+    st.write("")  # spacer
+with top_row_right:
+    with st.popover("💬 Dashboard Chat"):
+        st.markdown("### 💬 Chatbot")
+        st.caption("LLM-powered assistant. It uses live dashboard context and your question to generate answers.")
+
+        # Key entry (optional if secrets/env already set)
+        key_in = st.text_input(
+            "OpenAI API key (optional if set in Secrets/ENV)",
+            type="password",
+            value=st.session_state.get("chat_api_key", ""),
+            placeholder="sk-...",
+            help="Stored only in session_state for this run."
+        )
+        if key_in.strip():
+            st.session_state["chat_api_key"] = key_in.strip()
+
+        api_key = get_openai_key()
+        if not api_key:
+            st.warning("No API key found. Set OPENAI_API_KEY in Streamlit Secrets or environment variable, or paste above.")
+
+        # Suggested questions
+        st.markdown("**Suggested questions:**")
+        sugg = st.selectbox(
+            "Pick one",
+            [
+                "Why is PR-AUC different from ROC-AUC here?",
+                "Explain what the top 6 SHAP features mean.",
+                "What does changing the threshold do to precision/recall?",
+                "Why do risk peaks appear before crisis years?",
+                "Summarise results in 4 dissertation-ready sentences."
+            ],
+            index=0
+        )
+        if st.button("Use suggested question"):
+            st.session_state["chat_draft"] = sugg
+
+        st.divider()
+
+        # Display messages
+        for m in st.session_state["chat_messages"][-12:]:
+            with st.chat_message(m["role"]):
+                st.markdown(m["content"])
+
+        # Input + send
+        user_text = st.chat_input("Ask about the dashboard…")
+        if user_text:
+            st.session_state["chat_last_error"] = None
+            st.session_state["chat_messages"].append({"role": "user", "content": user_text})
+
+            if not api_key:
+                st.session_state["chat_messages"].append({
+                    "role": "assistant",
+                    "content": "I can’t call the LLM yet because there is no API key set. Add OPENAI_API_KEY in Secrets/ENV or paste it above."
+                })
+                st.rerun()
+
+            # Build messages with context as system message
+            system_prompt = (
+                "You are a helpful dissertation assistant embedded inside a Streamlit dashboard. "
+                "Answer clearly and concretely. Use the provided dashboard context. "
+                "If something cannot be inferred from the context, say so.\n\n"
+                + build_dashboard_context_text()
+            )
+            messages = [{"role": "system", "content": system_prompt}] + st.session_state["chat_messages"][-10:]
+
+            try:
+                with st.status("Thinking…", expanded=False):
+                    reply = openai_chat_completion(api_key=api_key, messages=messages, model="gpt-4o-mini")
+                st.session_state["chat_messages"].append({"role": "assistant", "content": reply})
+            except Exception as e:
+                st.session_state["chat_last_error"] = str(e)
+                st.session_state["chat_messages"].append({
+                    "role": "assistant",
+                    "content": "I hit an API error. Check your API key and app logs. (Tip: on Streamlit Cloud, open Manage app → Logs.)"
+                })
+
+            st.rerun()
+
+        if st.button("Clear chat history"):
+            st.session_state["chat_messages"] = [
+                {
+                    "role": "assistant",
+                    "content": "Chat cleared. Ask me anything about the dashboard."
+                }
+            ]
+            st.rerun()
+
+        if st.session_state.get("chat_last_error"):
+            st.caption(f"Last error: `{st.session_state['chat_last_error']}`")
+
+# ======================================================================
 # TABS
 # ======================================================================
 
@@ -595,7 +761,7 @@ tab1, tab2, tab3, tab4 = st.tabs([
 ])
 
 # -----------------------------------------------------------------------------
-# TAB 1: Crisis risk + GDP + SHAP pie + Top-6 SHAP + explanations
+# TAB 1
 with tab1:
     st.header("Crisis risk over time", divider="gray")
 
@@ -603,13 +769,15 @@ with tab1:
         st.warning("No data for the selected filters.")
     else:
         if ALTAIR_OK:
-            chart = altair_risk_with_crisis_bands(
-                risk_df.sort_values(["country", "year"]),
-                crisis_years_df,
-                title="Predicted crisis probability (shaded = JST crisis years)",
-                threshold=threshold
+            st.altair_chart(
+                altair_risk_with_crisis_bands(
+                    risk_df.sort_values(["country", "year"]),
+                    crisis_years_df,
+                    title="Predicted crisis probability (shaded = JST crisis years)",
+                    threshold=threshold
+                ),
+                use_container_width=True
             )
-            st.altair_chart(chart, use_container_width=True)
         else:
             st.line_chart(risk_df, x="year", y="crisis_prob", color="country")
             st.info("Install `altair` to enable RGB colors + crisis shading + interactive tooltips.")
@@ -623,7 +791,7 @@ with tab1:
         for i, c in enumerate(["USA", "UK", "Canada"]):
             with cols[i]:
                 if c not in risk_countries:
-                    st.metric(label=f"{c} risk", value="(not selected)")
+                    st.metric(label=f"{c} crisis risk", value="(not selected)")
                     continue
                 val = latest[latest["country"] == c]["crisis_prob"].mean()
                 if pd.isna(val):
@@ -650,7 +818,7 @@ with tab1:
     left, right = st.columns(2)
 
     with left:
-        st.markdown("### 🌍 GDP")
+        st.markdown("### 🌍 GDP (from JST)")
         if not macro_df.empty and "gdp" in macro_df.columns and not macro_df["gdp"].isna().all():
             if ALTAIR_OK:
                 st.altair_chart(
@@ -690,9 +858,8 @@ with tab1:
 
     with right:
         st.markdown("### 🧠 SHAP Feature Importance")
-        st.caption("SHAP allocates the prediction (relative to a baseline) across features. Larger **|SHAP|** = bigger influence.")
+        st.caption("SHAP splits the prediction (relative to a baseline) across features. Bigger |SHAP| = bigger influence.")
 
-        # Compute SHAP once and reuse (pie + top6 + explanations)
         try:
             global_shap = compute_shap_global(
                 selected_model=selected_model,
@@ -701,17 +868,19 @@ with tab1:
                 sample_n=shap_sample_n
             )
 
-            # --- Pie chart (interactive if Altair available)
             st.markdown("#### Pie: global impact share (mean |SHAP|)")
-            st.caption("This pie shows **share of total mean(|SHAP|)** across sampled test rows (global importance).")
+            st.caption("Share of total mean(|SHAP|) across sampled test rows (global importance).")
+
             if ALTAIR_OK:
-                render_shap_pie_altair(global_shap, top_k=8, title="SHAP Feature Impact Share (mean |SHAP|)")
+                render_shap_pie_altair(global_shap, top_k=8)
             else:
-                # fallback pie
                 top = global_shap.head(8).copy()
                 other = float(global_shap["share"].iloc[8:].sum()) if len(global_shap) > 8 else 0.0
                 if other > 0:
-                    top = pd.concat([top, pd.DataFrame([{"Feature": "Other", "mean_abs": np.nan, "mean_signed": 0.0, "share": other}])], ignore_index=True)
+                    top = pd.concat(
+                        [top, pd.DataFrame([{"Feature": "Other", "mean_abs": np.nan, "mean_signed": 0.0, "share": other}])],
+                        ignore_index=True
+                    )
                 plt.figure(figsize=(7, 6))
                 plt.pie(top["share"], labels=top["Feature"], autopct=lambda p: f"{p:.1f}%" if p >= 4 else "", startangle=90)
                 plt.title("SHAP Feature Impact Share (mean |SHAP|)")
@@ -719,18 +888,24 @@ with tab1:
                 st.info("Install `altair` for an interactive pie chart.")
 
             st.write("")
+            st.markdown("#### SHAP explainability (right under the pie)")
+            st.markdown(
+                "- **Positive SHAP** → pushes predicted crisis risk **up**.\n"
+                "- **Negative SHAP** → pushes predicted crisis risk **down**.\n"
+                "- **mean(|SHAP|)** → global importance (how strongly a feature tends to matter overall).\n"
+                "- The pie uses **share of mean(|SHAP|)**, so it’s a **global feature influence** summary."
+            )
+
+            st.write("")
             st.markdown("#### Top 6 SHAP drivers (graph + explanation)")
             render_top6_bar(global_shap, top_n=6, title="Top 6 drivers (mean |SHAP|)")
 
-            # Explanation right under the chart (as you asked)
             top6 = global_shap.head(6).copy()
             st.markdown("**What the top 6 represent**")
             st.markdown(
-                "- The bar chart ranks features by **mean(|SHAP|)** across the sampled rows.\n"
-                "- It answers: *which variables influence the model the most overall?*\n"
+                "- Ranked by **mean(|SHAP|)** over the sampled rows.\n"
                 "- The direction note uses **mean(SHAP)** (average sign)."
             )
-
             for _, row in top6.iterrows():
                 feat = str(row["Feature"])
                 dir_note = direction_arrow(float(row["mean_signed"]))
