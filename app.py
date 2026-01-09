@@ -115,6 +115,39 @@ def direction_arrow(mean_signed: float) -> str:
     return "≈ neutral (on average)"
 
 # -----------------------------------------------------------------------------
+# Behavioural proxy layman explanations (Explain-only tab)
+BEHAVIOUR_PROXY_EXPLAIN = {
+    "risk_appetite_z": (
+        "Risk appetite = how willing investors are to take risks. "
+        "When this is high, markets usually feel confident and people prefer risky assets. "
+        "When it drops, people often ‘run to safety’, which can be an early warning sign."
+    ),
+    "market_volatility_z": (
+        "Market volatility = how jumpy and unstable markets are. "
+        "Higher volatility means prices are swinging more than usual, showing uncertainty and fear. "
+        "Sustained spikes can signal stress building up in the financial system."
+    ),
+    "debt_service_risk_z": (
+        "Debt service risk = how hard it is to repay debt when debt levels and interest rates are high. "
+        "If this rises, borrowers may struggle to repay, and defaults become more likely. "
+        "That can weaken banks and the wider economy."
+    ),
+}
+
+OUTCOME_EXPLAIN = {
+    "gdp_growth": "GDP growth shows whether the economy is expanding or slowing down.",
+    "inflation": "Inflation shows how quickly prices are rising. High inflation can squeeze spending and push interest rates up.",
+    "unemp_chg": "Unemployment change shows whether joblessness is worsening or improving.",
+    "crisis_prob": "Crisis probability is the model’s estimated risk of a crisis (based on model inputs, not these behavioural proxies).",
+}
+
+def explain_proxy_short(proxy_col: str) -> str:
+    return BEHAVIOUR_PROXY_EXPLAIN.get(proxy_col, "This proxy summarises a behavioural risk condition in the financial system.")
+
+def explain_outcome_short(out_col: str) -> str:
+    return OUTCOME_EXPLAIN.get(out_col, "This is an outcome used to understand how the economy typically behaves when behaviour changes.")
+
+# -----------------------------------------------------------------------------
 # HEADER
 st.title("📉 Financial Crisis Early Warning System (EWS)")
 st.caption("USA · UK · Canada | JST dataset | Multi-model pipeline + SHAP explainability")
@@ -130,7 +163,7 @@ with st.sidebar:
         st.rerun()
 
 # ======================================================================
-# DATA + PIPELINE FUNCTIONS (Your multi-model pipeline)
+# DATA + PIPELINE FUNCTIONS
 # ======================================================================
 
 @st.cache_data
@@ -150,7 +183,6 @@ def engineer_features(df):
     if "crisisJST" not in df.columns:
         df["crisisJST"] = 0
 
-    # Leverage risk (guard if lev missing)
     lev = _safe_series(df, "lev").astype(float)
     df["leverage_risk"] = 1 / (lev + 0.01)
 
@@ -221,27 +253,21 @@ def engineer_behavioural_proxies(df_raw: pd.DataFrame) -> pd.DataFrame:
     - risk_appetite: risky_tr − safe_tr
     - market_volatility: 5y rolling std of Δ risky_tr
     - debt_service_risk: debtgdp × stir (simple stress proxy)
-    Plus a few outcomes for correlation visuals: GDP growth, inflation, unemployment change.
+    Plus outcomes for correlation visuals: GDP growth, inflation, unemployment change.
     """
     df = df_raw.copy()
     df["country"] = df["country"].astype(str).str.strip()
     df = df[df["country"].isin(["USA", "UK", "Canada"])].copy()
     df = df.sort_values(["country", "year"])
 
-    # Ensure crisis column exists
     if "crisisJST" not in df.columns:
         df["crisisJST"] = 0
 
     # Outcomes (safe if cols missing)
-    gdp = _safe_series(df, "gdp").astype(float)
-    cpi = _safe_series(df, "cpi").astype(float)
-    unemp = _safe_series(df, "unemp").astype(float)
-
     df["gdp_growth"] = df.groupby("country")["gdp"].pct_change() if "gdp" in df.columns else np.nan
     df["inflation"]  = df.groupby("country")["cpi"].pct_change() if "cpi" in df.columns else np.nan
     df["unemp_chg"]  = df.groupby("country")["unemp"].diff() if "unemp" in df.columns else np.nan
 
-    # Behavioural proxies
     risky_tr = _safe_series(df, "risky_tr").astype(float)
     safe_tr  = _safe_series(df, "safe_tr").astype(float)
     stir     = _safe_series(df, "stir").astype(float)
@@ -258,7 +284,6 @@ def engineer_behavioural_proxies(df_raw: pd.DataFrame) -> pd.DataFrame:
 
     df["debt_service_risk"] = debtgdp * stir
 
-    # Expanding z-score for comparability across long history
     def expanding_z(df_inner, col):
         def z(s):
             mu = s.expanding().mean()
@@ -373,9 +398,15 @@ def train_pipeline(jst_path: str):
     df_raw = load_data(jst_path)
 
     # macro series for GDP + real house price charts (from JST raw)
-    macro = df_raw[["country", "year", "gdp", "hpnom", "cpi", "crisisJST"]].copy() if all(
-        c in df_raw.columns for c in ["country", "year", "gdp", "hpnom", "cpi", "crisisJST"]
-    ) else df_raw[["country", "year", "crisisJST"]].copy()
+    if all(c in df_raw.columns for c in ["country", "year", "gdp", "hpnom", "cpi", "crisisJST"]):
+        macro = df_raw[["country", "year", "gdp", "hpnom", "cpi", "crisisJST"]].copy()
+    else:
+        macro = df_raw[["country", "year"]].copy()
+        macro["gdp"] = _safe_series(df_raw, "gdp")
+        macro["hpnom"] = _safe_series(df_raw, "hpnom")
+        macro["cpi"] = _safe_series(df_raw, "cpi")
+        macro["crisisJST"] = _safe_series(df_raw, "crisisJST")
+
     macro["house_price_real"] = _safe_series(macro, "hpnom").astype(float) / (_safe_series(macro, "cpi").astype(float) + 1e-9)
     macro = macro.sort_values(["country", "year"])
 
@@ -416,7 +447,7 @@ def train_pipeline(jst_path: str):
     for name, clf in build_model_set().items():
         res = evaluate_model(name, clf, Xs_train, y_train, Xs_val, y_val)
         fitted_models[name] = res["clf"]
-        results.append({k: v for k, v in res.items() if k != "clf"})  # Arrow-safe
+        results.append({k: v for k, v in res.items() if k != "clf"})
 
     results_df = pd.DataFrame(results).sort_values("F1", ascending=False).reset_index(drop=True)
     best_name = results_df.loc[0, "model"]
@@ -431,7 +462,7 @@ def train_pipeline(jst_path: str):
     return {
         "df_target": df_target,
         "macro": macro,
-        "behavioural": behavioural,  # <-- NEW
+        "behavioural": behavioural,
         "base_features": base_features,
         "missing_features": missing_features,
         "all_features": all_features,
@@ -495,7 +526,7 @@ def altair_risk_with_crisis_bands(risk_df, crisis_df, title, threshold=None):
     layers.append(line)
 
     if threshold is not None:
-        rule = alt.Chart(pd.DataFrame({"y":[float(threshold)]})).mark_rule(strokeDash=[6,4], opacity=0.95).encode(y="y:Q")
+        rule = alt.Chart(pd.DataFrame({"y": [float(threshold)]})).mark_rule(strokeDash=[6, 4], opacity=0.95).encode(y="y:Q")
         layers.append(rule)
 
     return alt.layer(*layers).properties(height=320, title=title).interactive()
@@ -579,7 +610,7 @@ bundle = train_pipeline(str(JST_XLSX))
 
 df_target = bundle["df_target"]
 macro = bundle["macro"]
-behavioural = bundle["behavioural"]  # <-- NEW
+behavioural = bundle["behavioural"]
 base_features = bundle["base_features"]
 missing_features = bundle["missing_features"]
 all_features = bundle["all_features"]
@@ -653,14 +684,10 @@ macro_df = macro[
 ].copy()
 
 # ======================================================================
-# CHATBOT (POPOVER POPUP) — appears above tabs and remains available
+# CHATBOT (POPOVER POPUP)
 # ======================================================================
 
 def get_openai_key() -> str | None:
-    # Priority:
-    # 1) st.session_state (user entered during runtime)
-    # 2) Streamlit Secrets
-    # 3) Environment variable
     if st.session_state.get("chat_api_key"):
         return st.session_state["chat_api_key"]
     if "OPENAI_API_KEY" in st.secrets:
@@ -669,7 +696,6 @@ def get_openai_key() -> str | None:
     return env_key if env_key else None
 
 def build_dashboard_context_text() -> str:
-    # Metrics for current selection
     probs = test_probs_by_model[model_choice]
     preds = (probs >= threshold).astype(int)
 
@@ -679,7 +705,6 @@ def build_dashboard_context_text() -> str:
     rec  = recall_score(y_test, preds, zero_division=0)
     f1   = f1_score(y_test, preds, zero_division=0)
 
-    # Top SHAP (global)
     top_shap = None
     try:
         g = compute_shap_global(selected_model, Xs_test, all_features, sample_n=min(150, shap_sample_n))
@@ -716,11 +741,7 @@ def build_dashboard_context_text() -> str:
 def openai_chat_completion(api_key: str, messages: list[dict], model: str = "gpt-4o-mini") -> str:
     url = "https://api.openai.com/v1/chat/completions"
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    payload = {
-        "model": model,
-        "messages": messages,
-        "temperature": 0.2,
-    }
+    payload = {"model": model, "messages": messages, "temperature": 0.2}
     r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=60)
     r.raise_for_status()
     data = r.json()
@@ -729,24 +750,19 @@ def openai_chat_completion(api_key: str, messages: list[dict], model: str = "gpt
 def init_chat():
     if "chat_messages" not in st.session_state:
         st.session_state["chat_messages"] = [
-            {
-                "role": "assistant",
-                "content": "Hi! Ask me anything about this dashboard (metrics, SHAP, crisis years, GDP/house prices, threshold effects)."
-            }
+            {"role": "assistant", "content": "Hi! Ask me anything about this dashboard (metrics, SHAP, crisis years, GDP/house prices, threshold effects)."}
         ]
 
 init_chat()
 
-# Place popover top-right-ish (above tabs)
 top_row_left, top_row_right = st.columns([0.78, 0.22], gap="small")
 with top_row_left:
-    st.write("")  # spacer
+    st.write("")
 with top_row_right:
     with st.popover("💬 Dashboard Chat"):
         st.markdown("### 💬 Chatbot")
         st.caption("LLM-powered assistant. It uses live dashboard context and your question to generate answers.")
 
-        # Key entry (optional if secrets/env already set)
         key_in = st.text_input(
             "OpenAI API key (optional if set in Secrets/ENV)",
             type="password",
@@ -761,7 +777,6 @@ with top_row_right:
         if not api_key:
             st.warning("No API key found. Set OPENAI_API_KEY in Streamlit Secrets or environment variable, or paste above.")
 
-        # Suggested questions
         st.markdown("**Suggested questions:**")
         sugg = st.selectbox(
             "Pick one",
@@ -779,12 +794,10 @@ with top_row_right:
 
         st.divider()
 
-        # Display messages
         for m in st.session_state["chat_messages"][-12:]:
             with st.chat_message(m["role"]):
                 st.markdown(m["content"])
 
-        # Input + send
         user_text = st.chat_input("Ask about the dashboard…")
         if user_text:
             st.session_state["chat_last_error"] = None
@@ -797,7 +810,6 @@ with top_row_right:
                 })
                 st.rerun()
 
-            # Build messages with context as system message
             system_prompt = (
                 "You are a helpful dissertation assistant embedded inside a Streamlit dashboard. "
                 "Answer clearly and concretely. Use the provided dashboard context. "
@@ -810,8 +822,8 @@ with top_row_right:
                 with st.status("Thinking…", expanded=False):
                     reply = openai_chat_completion(api_key=api_key, messages=messages, model="gpt-4o-mini")
                 st.session_state["chat_messages"].append({"role": "assistant", "content": reply})
-            except Exception:
-                st.session_state["chat_last_error"] = str(e) if "e" in locals() else "Unknown error"
+            except Exception as e:
+                st.session_state["chat_last_error"] = str(e)
                 st.session_state["chat_messages"].append({
                     "role": "assistant",
                     "content": "I hit an API error. Check your API key and app logs. (Tip: on Streamlit Cloud, open Manage app → Logs.)"
@@ -820,12 +832,7 @@ with top_row_right:
             st.rerun()
 
         if st.button("Clear chat history"):
-            st.session_state["chat_messages"] = [
-                {
-                    "role": "assistant",
-                    "content": "Chat cleared. Ask me anything about the dashboard."
-                }
-            ]
+            st.session_state["chat_messages"] = [{"role": "assistant", "content": "Chat cleared. Ask me anything about the dashboard."}]
             st.rerun()
 
         if st.session_state.get("chat_last_error"):
@@ -1006,7 +1013,7 @@ with tab1:
             st.warning("SHAP could not be computed for this model. Try Gradient Boosting / Random Forest, or reduce SHAP sample size.")
 
 # -----------------------------------------------------------------------------
-# TAB 2: Model results
+# TAB 2
 with tab2:
     st.header("Model comparison (validation)", divider="gray")
     st.dataframe(results_df, use_container_width=True)
@@ -1034,7 +1041,7 @@ with tab2:
     )
 
 # -----------------------------------------------------------------------------
-# TAB 3: SHAP detailed
+# TAB 3
 with tab3:
     st.header("SHAP explainability (detailed)", divider="gray")
     st.markdown(
@@ -1068,7 +1075,7 @@ SHAP explains predictions by distributing the difference between the prediction 
             st.pyplot(plt.gcf(), clear_figure=True)
 
 # -----------------------------------------------------------------------------
-# TAB 4: Data explorer
+# TAB 4
 with tab4:
     st.header("Data explorer (processed dataset used for modelling)", divider="gray")
     show_cols = ["country", "year", "crisisJST", "target"] + all_features
@@ -1113,15 +1120,7 @@ with tab5:
         with cL:
             proxy_label = st.selectbox("Select behavioural proxy", list(proxy_options.keys()), index=0)
             outcome_label = st.selectbox("Select outcome", list(outcome_options.keys()), index=0)
-            lag = st.slider("Lag (years): correlate proxy(t) with outcome(t+lag)", 0, 3, 1, 1)
-
-            st.markdown("**How to read this tab**")
-            st.markdown(
-                "- **Time series** shows the proxy and highlights crisis years.\n"
-                "- **Lag correlation** checks whether proxy tends to lead outcomes.\n"
-                "- **Scatter** shows whether crisis years cluster at extremes.\n"
-                "- **Heatmap** summarises correlations among proxies & outcomes."
-            )
+            lag = st.slider("Lag (years): compare proxy(t) with outcome(t+lag)", 0, 3, 1, 1)
 
         beh2 = beh.copy()
         if outcome_options[outcome_label] == "__MODEL_RISK__":
@@ -1133,6 +1132,11 @@ with tab5:
 
         proxy_col = proxy_options[proxy_label]
         beh2["out_lagged"] = beh2.groupby("country")[out_col].shift(-lag)
+
+        # One-line meaning under selectors
+        with cL:
+            st.caption(f"Proxy meaning: {explain_proxy_short(proxy_col)}")
+            st.caption(f"Outcome meaning: {explain_outcome_short(out_col)}")
 
         # 1) Time series with crisis shading
         st.subheader("1) Proxy over time (shaded = crisis years)", divider="gray")
@@ -1152,13 +1156,19 @@ with tab5:
             line = alt.Chart(beh2).mark_line().encode(
                 x=alt.X("year:Q", title="year"),
                 y=alt.Y(f"{proxy_col}:Q", title=proxy_label),
-                color=alt.Color("country:N", scale=alt.Scale(domain=domain, range=range_colors), legend=alt.Legend(title="country")),
+                color=alt.Color("country:N", scale=alt.Scale(domain=domain, range=range_colors),
+                                legend=alt.Legend(title="country")),
                 tooltip=["country:N", "year:Q", alt.Tooltip(f"{proxy_col}:Q", format=".3f")],
             )
 
             st.altair_chart((rect + line).properties(height=320).interactive(), use_container_width=True)
         else:
             st.line_chart(beh2, x="year", y=proxy_col, color="country")
+
+        st.caption(
+            f"🧠 What this means: {explain_proxy_short(proxy_col)} "
+            f"Shaded bands mark crisis years, so you can see whether this behaviour tends to rise or fall around crises."
+        )
 
         # 2) Lag correlation bars
         st.subheader("2) Lag correlation: proxy(t) vs outcome(t+lag)", divider="gray")
@@ -1186,11 +1196,17 @@ with tab5:
         else:
             st.dataframe(corr_df, use_container_width=True)
 
+        st.caption(
+            f"🧭 What this means: This checks whether changes in **{proxy_label}** tend to come **before** changes in **{outcome_label}** "
+            f"(using a {lag}-year lead). Values near +1 mean they usually move together; near −1 means they move opposite. "
+            f"This is correlation (a pattern), not proof of cause."
+        )
+
         # 3) Scatter with crisis highlighting
         st.subheader("3) Scatter: proxy vs outcome (crisis years highlighted)", divider="gray")
         scat = beh2[["country", "year", "crisisJST", proxy_col, "out_lagged"]].dropna().copy()
         if scat.empty:
-            st.info("Not enough data for scatter (missing values after lagging). Try a different window or lag.")
+            st.info("Not enough data for scatter (missing values after lagging). Try a wider window or smaller lag.")
         else:
             scat["crisis_flag"] = scat["crisisJST"].map({0: "Normal", 1: "Crisis year"})
             if ALTAIR_OK:
@@ -1209,6 +1225,11 @@ with tab5:
                 st.altair_chart(chart, use_container_width=True)
             else:
                 st.dataframe(scat.head(50), use_container_width=True)
+
+            st.caption(
+                "🎯 What this means: Each dot is a year. If crisis-year dots cluster at extreme proxy values, "
+                "it suggests this behaviour is often present when crises happen (or just before, depending on the lag)."
+            )
 
         # 4) Correlation heatmap
         st.subheader("4) Correlation heatmap (within selection)", divider="gray")
@@ -1237,6 +1258,12 @@ with tab5:
                 st.altair_chart(heat, use_container_width=True)
             else:
                 st.dataframe(corr, use_container_width=True)
+
+        st.caption(
+            "🗺️ What this means: This heatmap summarises how strongly variables move together in your selected window. "
+            "Values near +1 mean they move together, near −1 means they move opposite, near 0 means little relationship. "
+            "It’s a quick overview, not a causal claim."
+        )
 
         st.divider()
         st.markdown("**Note:** Correlation ≠ causation. These charts are included to explain relationships and timing, not to train the model.")
