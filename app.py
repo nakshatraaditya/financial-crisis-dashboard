@@ -7,7 +7,7 @@
 #  ✅ Chat remembers conversation in st.session_state
 #  ✅ Chat gets LIVE dashboard context (model, threshold, metrics, top SHAP)
 #
-#  NEW (Dissertation-worthy evaluation visuals):
+#  Includes (Dissertation-worthy evaluation visuals):
 #  ✅ Threshold trade-off curves (Precision/Recall/F1 vs threshold)
 #  ✅ Calibration (reliability) plot
 #  ✅ Event-level early-warning capture + lead time
@@ -16,6 +16,9 @@
 #
 #  FIX (requested):
 #  ✅ SHAP pie chart (matplotlib fallback) now uses LEGEND (no slice labels)
+#
+#  Includes (requested):
+#  ✅ Local SHAP (single-year explanation) in Tab 3
 #
 #  IMPORTANT:
 #  - Put JSTdatasetR6.xlsx next to this app.py
@@ -314,6 +317,7 @@ def engineer_behavioural_proxies(df_raw: pd.DataFrame) -> pd.DataFrame:
 
 def clean_data(df, base_features):
     df = df.copy()
+
     df = df[~df["year"].between(1914, 1918)]
     df = df[~df["year"].between(1939, 1945)]
 
@@ -323,7 +327,6 @@ def clean_data(df, base_features):
     df[base_features] = df.groupby("country")[base_features].transform(
         lambda x: x.ffill(limit=3).bfill(limit=3)
     )
-
     df[base_features] = df.groupby("country")[base_features].transform(
         lambda x: x.fillna(x.median())
     )
@@ -398,7 +401,7 @@ def evaluate_model(name, model, X_tr, y_tr, X_val, y_val):
     }
 
 # ======================================================================
-# Evaluation helpers (NEW)
+# Evaluation helpers
 # ======================================================================
 
 def threshold_curve_df(y_true: np.ndarray, probs: np.ndarray, step: float = 0.01) -> pd.DataFrame:
@@ -498,6 +501,10 @@ def confusion_heatmap(cm: np.ndarray, title: str = "Confusion matrix"):
         st.pyplot(fig, clear_figure=True)
 
 def local_shap_top_drivers(selected_model, X_background: pd.DataFrame, X_row: pd.DataFrame, feature_names: list[str], top_k: int = 5):
+    """
+    Local SHAP for ONE row.
+    Returns top_k features by absolute local SHAP.
+    """
     explainer = shap.Explainer(selected_model, X_background)
     sv = explainer(X_row)
     vals = sv.values
@@ -516,22 +523,19 @@ def local_shap_top_drivers(selected_model, X_background: pd.DataFrame, X_row: pd
 def train_pipeline(jst_path: str):
     df_raw = load_data(jst_path)
 
-    # macro series for GDP + real house price charts (from JST raw)
-    if all(c in df_raw.columns for c in ["country", "year", "gdp", "hpnom", "cpi", "crisisJST"]):
-        macro = df_raw[["country", "year", "gdp", "hpnom", "cpi", "crisisJST"]].copy()
-    else:
-        macro = df_raw[["country", "year"]].copy()
-        macro["gdp"] = _safe_series(df_raw, "gdp")
-        macro["hpnom"] = _safe_series(df_raw, "hpnom")
-        macro["cpi"] = _safe_series(df_raw, "cpi")
-        macro["crisisJST"] = _safe_series(df_raw, "crisisJST")
-
-    macro["house_price_real"] = _safe_series(macro, "hpnom").astype(float) / (_safe_series(macro, "cpi").astype(float) + 1e-9)
+    # Macro (for charts)
+    macro = df_raw[["country", "year"]].copy()
+    macro["gdp"] = _safe_series(df_raw, "gdp")
+    macro["hpnom"] = _safe_series(df_raw, "hpnom")
+    macro["cpi"] = _safe_series(df_raw, "cpi")
+    macro["crisisJST"] = _safe_series(df_raw, "crisisJST")
+    macro["house_price_real"] = macro["hpnom"].astype(float) / (macro["cpi"].astype(float) + 1e-9)
     macro = macro.sort_values(["country", "year"])
 
     # Behavioural (explain-only)
     behavioural = engineer_behavioural_proxies(df_raw)
 
+    # Model features
     df_feat, base_features = engineer_features(df_raw)
     df_clean = clean_data(df_feat, base_features)
     df_target = create_target(df_clean).reset_index(drop=True)
@@ -704,7 +708,7 @@ def render_shap_pie_altair(global_df, top_k=8, title="SHAP Feature Impact Share 
 
 def render_shap_pie_matplotlib(global_df: pd.DataFrame, top_k: int = 8, title: str = "SHAP Feature Impact Share (mean |SHAP|)"):
     """
-    FIXED: No slice labels (prevents overlap); use legend instead.
+    FIXED: No slice labels (prevents overlap); legend instead.
     """
     df = global_df[["Feature", "share"]].copy().sort_values("share", ascending=False).reset_index(drop=True)
 
@@ -714,14 +718,13 @@ def render_shap_pie_matplotlib(global_df: pd.DataFrame, top_k: int = 8, title: s
         top = pd.concat([top, pd.DataFrame([{"Feature": "Other", "share": other}])], ignore_index=True)
 
     fig, ax = plt.subplots(figsize=(8.5, 6))
-    wedges, _, autotexts = ax.pie(
+    wedges, _, _ = ax.pie(
         top["share"],
-        labels=None,  # ✅ remove labels on slices
+        labels=None,
         autopct=lambda p: f"{p:.1f}%" if p >= 4 else "",
         startangle=90
     )
     ax.set_title(title)
-
     ax.legend(
         wedges,
         top["Feature"],
@@ -730,7 +733,6 @@ def render_shap_pie_matplotlib(global_df: pd.DataFrame, top_k: int = 8, title: s
         bbox_to_anchor=(1.02, 0.5),
         frameon=False
     )
-
     st.pyplot(fig, clear_figure=True)
 
 def render_top6_bar(global_df, top_n=6, title="Top drivers (mean |SHAP|)"):
@@ -767,6 +769,7 @@ behavioural = bundle["behavioural"]
 base_features = bundle["base_features"]
 missing_features = bundle["missing_features"]
 all_features = bundle["all_features"]
+scaler = bundle["scaler"]
 models = bundle["models"]
 results_df = bundle["results_df"]
 best_name = bundle["best_name"]
@@ -842,7 +845,7 @@ macro_df = macro[
 # CHATBOT (POPOVER POPUP)
 # ======================================================================
 
-def get_openai_key() -> str | None:
+def get_openai_key():
     if st.session_state.get("chat_api_key"):
         return st.session_state["chat_api_key"]
     if "OPENAI_API_KEY" in st.secrets:
@@ -880,6 +883,7 @@ def build_dashboard_context_text() -> str:
         ctx.append(f"- Crisis years count in current window: {crisis_counts}")
     else:
         ctx.append("- Crisis years count in current window: none or not in selection")
+
     if top_shap is not None:
         rows = []
         for _, r in top_shap.iterrows():
@@ -1120,7 +1124,6 @@ with tab1:
             if ALTAIR_OK:
                 render_shap_pie_altair(global_shap, top_k=8)
             else:
-                # ✅ FIXED: matplotlib pie uses legend, no overlapping labels
                 render_shap_pie_matplotlib(global_shap, top_k=8)
 
             st.write("")
@@ -1128,7 +1131,7 @@ with tab1:
             render_top6_bar(global_shap, top_n=6, title="Top 6 drivers (mean |SHAP|)")
 
             top6 = global_shap.head(6).copy()
-            st.markdown("**What the top 6 represent**")
+            st.markdown("**What the top 6 represent (layman):**")
             for _, row in top6.iterrows():
                 feat = str(row["Feature"])
                 dir_note = direction_arrow(float(row["mean_signed"]))
@@ -1171,10 +1174,10 @@ with tab2:
         meta["pred"] = test_preds
         fa = meta[(meta["pred"] == 1) & (meta["target"] == 0)].copy()
         fa = fa.sort_values(["prob"], ascending=False)
-        st.dataframe(fa.head(60), use_container_width=True)
+        st.dataframe(fa.head(80), use_container_width=True)
 
 # -----------------------------------------------------------------------------
-# TAB 3: SHAP detailed
+# TAB 3: SHAP detailed (Global + Local)
 with tab3:
     st.header("SHAP explainability (detailed)", divider="gray")
     st.markdown(
@@ -1205,6 +1208,66 @@ with tab3:
 
             st.pyplot(plt.gcf(), clear_figure=True)
 
+    st.divider()
+    st.subheader("Local SHAP (why this specific year?)", divider="gray")
+    st.caption("This explains ONE prediction by showing which features pushed that year's risk up or down.")
+
+    pick_country = st.selectbox("Country", options=risk_countries, index=0, key="local_shap_country")
+    years_avail = sorted(risk_df[risk_df["country"] == pick_country]["year"].unique().tolist())
+    if years_avail:
+        pick_year = st.selectbox("Year", options=years_avail, index=len(years_avail) - 1, key="local_shap_year")
+    else:
+        pick_year = None
+        st.warning("No years available for this country in the selected window.")
+
+    top_k = st.slider("How many drivers to show", 3, 10, 5, 1, key="local_shap_topk")
+
+    if pick_year is not None:
+        row = df_target[(df_target["country"] == pick_country) & (df_target["year"] == pick_year)]
+        if row.empty:
+            st.warning("That row is not available in the modelling dataset (it may be dropped by target shifting).")
+        else:
+            X_row = row[all_features].copy()
+
+            # scale exactly like training
+            X_row_cont = scaler.transform(X_row[base_features])
+            X_row_scaled = np.hstack([X_row_cont, X_row[missing_features].values])  # shape (1, n_features)
+            X_row_scaled_df = pd.DataFrame(X_row_scaled, columns=all_features)
+
+            # background for SHAP (speed)
+            X_bg = pd.DataFrame(Xs_test, columns=all_features).sample(
+                n=min(200, len(Xs_test)),
+                random_state=42
+            )
+
+            p = float(selected_model.predict_proba(X_row_scaled)[:, 1][0])
+            st.metric("Predicted crisis probability (this year)", f"{p*100:.1f}%")
+
+            local_df = local_shap_top_drivers(
+                selected_model=selected_model,
+                X_background=X_bg,
+                X_row=X_row_scaled_df,
+                feature_names=all_features,
+                top_k=top_k
+            )
+            local_df["direction"] = local_df["shap"].apply(lambda v: "↑ pushes risk up" if v > 0 else "↓ pushes risk down")
+            local_df["shap_abs"] = local_df["abs"]
+
+            if ALTAIR_OK:
+                chart = alt.Chart(local_df).mark_bar().encode(
+                    x=alt.X("shap_abs:Q", title="|local SHAP| (impact strength)"),
+                    y=alt.Y("Feature:N", sort="-x", title=None),
+                    tooltip=["Feature:N", alt.Tooltip("shap:Q", format=".6f"), "direction:N"]
+                ).properties(height=280).interactive()
+                st.altair_chart(chart, use_container_width=True)
+            else:
+                st.dataframe(local_df[["Feature", "shap", "direction"]], use_container_width=True)
+
+            st.caption(
+                "Layman: these are the main reasons the model’s risk estimate went up or down for this year. "
+                "Bigger |SHAP| means that factor mattered more in this specific prediction."
+            )
+
 # -----------------------------------------------------------------------------
 # TAB 4: Data explorer
 with tab4:
@@ -1215,11 +1278,16 @@ with tab4:
         use_container_width=True
     )
 
+    with st.expander("Show feature lists"):
+        st.write("**Base (continuous) features**:", base_features)
+        st.write("**Missing flags**:", missing_features)
+        st.write("**All features (model input order)**:", all_features)
+
 # -----------------------------------------------------------------------------
 # TAB 5: Behavioural Drivers (Explain-only)
 with tab5:
     st.header("Behavioural drivers (Explain-only)", divider="gray")
-    st.caption("These variables are engineered for interpretation and visual insight. They are NOT used in the model pipeline.")
+    st.caption("These are for interpretation and insight. They are NOT used in the model pipeline.")
 
     beh = behavioural[
         (behavioural["country"].isin(risk_countries)) &
@@ -1231,9 +1299,9 @@ with tab5:
         st.warning("No behavioural data for the selected filters.")
     else:
         proxy_options = {
-            "Risk appetite (risky_tr − safe_tr)": "risk_appetite_z",
-            "Market volatility (5y rolling std of Δ risky_tr)": "market_volatility_z",
-            "Debt service risk (debtgdp × stir)": "debt_service_risk_z",
+            "Risk appetite (risky_tr − safe_tr) [z-score]": "risk_appetite_z",
+            "Market volatility (5y rolling std of Δ risky_tr) [z-score]": "market_volatility_z",
+            "Debt service risk (debtgdp × stir) [z-score]": "debt_service_risk_z",
         }
         outcome_options = {
             "GDP growth (Δ gdp)": "gdp_growth",
@@ -1260,8 +1328,8 @@ with tab5:
         beh2["out_lagged"] = beh2.groupby("country")[out_col].shift(-lag)
 
         with cL:
-            st.caption(f"Proxy meaning: {explain_proxy_short(proxy_col)}")
-            st.caption(f"Outcome meaning: {explain_outcome_short(out_col)}")
+            st.caption(f"**Proxy meaning:** {explain_proxy_short(proxy_col)}")
+            st.caption(f"**Outcome meaning:** {explain_outcome_short(out_col)}")
 
         st.subheader("Proxy over time (shaded = crisis years)", divider="gray")
         if ALTAIR_OK:
@@ -1291,6 +1359,35 @@ with tab5:
 
         st.caption(f"🧠 {explain_proxy_short(proxy_col)}")
 
+        st.subheader("Correlation view (simple, visual)", divider="gray")
+        scatter = beh2.dropna(subset=[proxy_col, "out_lagged"]).copy()
+        if scatter.empty:
+            st.info("Not enough data (missing values) to plot correlation for this selection.")
+        else:
+            scatter["proxy"] = scatter[proxy_col]
+            scatter["outcome"] = scatter["out_lagged"]
+
+            if ALTAIR_OK:
+                domain, range_colors = build_color_scale(scatter["country"].unique())
+                ch = alt.Chart(scatter).mark_circle(size=60, opacity=0.6).encode(
+                    x=alt.X("proxy:Q", title=f"{proxy_label} (t)"),
+                    y=alt.Y("outcome:Q", title=f"{outcome_label} (t+{lag})"),
+                    color=alt.Color("country:N", scale=alt.Scale(domain=domain, range=range_colors), legend=alt.Legend(title="country")),
+                    tooltip=["country:N", "year:Q", alt.Tooltip("proxy:Q", format=".3f"), alt.Tooltip("outcome:Q", format=".3f")],
+                ).properties(height=320).interactive()
+                st.altair_chart(ch, use_container_width=True)
+            else:
+                st.dataframe(scatter[["country", "year", proxy_col, "out_lagged"]].head(50), use_container_width=True)
+
+            # quick numeric correlation per country
+            corr_rows = []
+            for c in sorted(scatter["country"].unique()):
+                s = scatter[scatter["country"] == c]
+                corr = float(s["proxy"].corr(s["outcome"])) if len(s) >= 5 else np.nan
+                corr_rows.append({"country": c, "corr(proxy, outcome)": corr, "n": int(len(s))})
+            st.dataframe(pd.DataFrame(corr_rows), use_container_width=True)
+            st.caption("Layman: correlation just shows whether they tend to move together (positive) or opposite (negative). It does NOT prove causation.")
+
 # -----------------------------------------------------------------------------
 # TAB 6: Evaluation (Dissertation)
 with tab6:
@@ -1305,9 +1402,12 @@ with tab6:
 
     if ALTAIR_OK:
         base = alt.Chart(tdf).encode(x=alt.X("threshold:Q", title="threshold"))
-        p_line = base.mark_line().encode(y=alt.Y("precision:Q", title="score"), tooltip=["threshold:Q", alt.Tooltip("precision:Q", format=".3f")])
-        r_line = base.mark_line().encode(y="recall:Q", tooltip=["threshold:Q", alt.Tooltip("recall:Q", format=".3f")])
-        f_line = base.mark_line().encode(y="f1:Q", tooltip=["threshold:Q", alt.Tooltip("f1:Q", format=".3f")])
+        p_line = base.mark_line().encode(y=alt.Y("precision:Q", title="score"),
+                                         tooltip=["threshold:Q", alt.Tooltip("precision:Q", format=".3f")])
+        r_line = base.mark_line().encode(y="recall:Q",
+                                         tooltip=["threshold:Q", alt.Tooltip("recall:Q", format=".3f")])
+        f_line = base.mark_line().encode(y="f1:Q",
+                                         tooltip=["threshold:Q", alt.Tooltip("f1:Q", format=".3f")])
         rule = alt.Chart(pd.DataFrame({"threshold":[threshold]})).mark_rule(strokeDash=[6,4]).encode(x="threshold:Q")
         st.altair_chart((p_line + r_line + f_line + rule).properties(height=280).interactive(), use_container_width=True)
     else:
@@ -1338,6 +1438,8 @@ with tab6:
             ax.plot(cdf["p_mean"], cdf["y_rate"], marker="o")
             ax.set_xlabel("mean predicted probability"); ax.set_ylabel("observed crisis rate")
             st.pyplot(fig, clear_figure=True)
+    else:
+        st.info("Not enough data to compute calibration bins.")
 
     st.subheader("Event-level early warning (did we warn before crisis episodes?)", divider="gray")
     window_left = st.slider("Warning window start (years before crisis)", 1, 5, 2, 1, key="ew_left")
@@ -1347,9 +1449,12 @@ with tab6:
         st.warning("Warning window must be like t-2 to t-1 (start > end). Increase the start slider.")
     else:
         ev = event_level_early_warning(risk_full, threshold=threshold, window=(window_left, window_right))
-        if not ev.empty:
+        if ev.empty:
+            st.info("No crisis episodes detected (or no data).")
+        else:
             s = ev.groupby("country")["captured"].agg(["sum", "count"]).reset_index()
             s["capture_rate"] = s["sum"] / s["count"]
             st.dataframe(s, use_container_width=True)
+
             with st.expander("Show episode-level details (lead time)"):
                 st.dataframe(ev.sort_values(["country", "crisis_start"]), use_container_width=True)
