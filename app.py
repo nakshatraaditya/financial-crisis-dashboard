@@ -7,6 +7,13 @@
 #  ✅ Chat remembers conversation in st.session_state
 #  ✅ Chat gets LIVE dashboard context (model, threshold, metrics, top SHAP)
 #
+#  NEW (Dissertation-worthy evaluation visuals):
+#  ✅ Threshold trade-off curves (Precision/Recall/F1 vs threshold)
+#  ✅ Calibration (reliability) plot
+#  ✅ Event-level early-warning capture + lead time
+#  ✅ Confusion matrix heatmap + false-alarm year list
+#  ✅ “Driver for a given year” (local SHAP top drivers)
+#
 #  IMPORTANT:
 #  - Put JSTdatasetR6.xlsx next to this app.py
 #  - Add OPENAI_API_KEY in Streamlit Secrets OR environment variable
@@ -21,7 +28,7 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 
-# Optional Altair for interactive RGB + shading + interactive pie
+# Optional Altair for interactive charts
 try:
     import altair as alt
     ALTAIR_OK = True
@@ -263,7 +270,6 @@ def engineer_behavioural_proxies(df_raw: pd.DataFrame) -> pd.DataFrame:
     if "crisisJST" not in df.columns:
         df["crisisJST"] = 0
 
-    # Outcomes (safe if cols missing)
     df["gdp_growth"] = df.groupby("country")["gdp"].pct_change() if "gdp" in df.columns else np.nan
     df["inflation"]  = df.groupby("country")["cpi"].pct_change() if "cpi" in df.columns else np.nan
     df["unemp_chg"]  = df.groupby("country")["unemp"].diff() if "unemp" in df.columns else np.nan
@@ -305,7 +311,6 @@ def engineer_behavioural_proxies(df_raw: pd.DataFrame) -> pd.DataFrame:
 
 def clean_data(df, base_features):
     df = df.copy()
-
     df = df[~df["year"].between(1914, 1918)]
     df = df[~df["year"].between(1939, 1945)]
 
@@ -390,6 +395,127 @@ def evaluate_model(name, model, X_tr, y_tr, X_val, y_val):
     }
 
 # ======================================================================
+# Evaluation helpers (NEW)
+# ======================================================================
+
+def threshold_curve_df(y_true: np.ndarray, probs: np.ndarray, step: float = 0.01) -> pd.DataFrame:
+    rows = []
+    for t in np.arange(0.01, 0.99, step):
+        preds = (probs >= t).astype(int)
+        rows.append({
+            "threshold": float(t),
+            "precision": float(precision_score(y_true, preds, zero_division=0)),
+            "recall": float(recall_score(y_true, preds, zero_division=0)),
+            "f1": float(f1_score(y_true, preds, zero_division=0)),
+            "alert_rate": float(preds.mean()),
+        })
+    return pd.DataFrame(rows)
+
+def calibration_df(y_true: np.ndarray, probs: np.ndarray, n_bins: int = 10) -> pd.DataFrame:
+    # Bins by predicted probability
+    df = pd.DataFrame({"y": y_true.astype(int), "p": probs.astype(float)}).dropna()
+    if df.empty:
+        return pd.DataFrame(columns=["bin", "p_mean", "y_rate", "count"])
+    df["bin"] = pd.cut(df["p"], bins=np.linspace(0, 1, n_bins + 1), include_lowest=True)
+    g = df.groupby("bin", observed=True).agg(
+        p_mean=("p", "mean"),
+        y_rate=("y", "mean"),
+        count=("y", "size")
+    ).reset_index()
+    g["bin"] = g["bin"].astype(str)
+    return g
+
+def crisis_episodes(crisis_years: list[int]) -> list[tuple[int, int]]:
+    # contiguous runs from a list of years
+    if not crisis_years:
+        return []
+    ys = sorted(set(crisis_years))
+    episodes = []
+    start = ys[0]
+    prev = ys[0]
+    for y in ys[1:]:
+        if y == prev + 1:
+            prev = y
+        else:
+            episodes.append((start, prev))
+            start = y
+            prev = y
+    episodes.append((start, prev))
+    return episodes
+
+def event_level_early_warning(risk_full: pd.DataFrame, threshold: float, window=(2, 1)) -> pd.DataFrame:
+    """
+    For each crisis episode, check if any warning happens in [start-window_left, start-window_right].
+    window=(2,1) means years t-2 to t-1 relative to crisis start.
+    """
+    left, right = window
+    out_rows = []
+    for c in sorted(risk_full["country"].unique()):
+        d = risk_full[risk_full["country"] == c].sort_values("year").copy()
+        crisis_years = d.loc[d["crisisJST"] == 1, "year"].dropna().astype(int).tolist()
+        episodes = crisis_episodes(crisis_years)
+
+        for (start, end) in episodes:
+            warn_start = start - left
+            warn_end = start - right
+            w = d[(d["year"] >= warn_start) & (d["year"] <= warn_end)].copy()
+            w_hit = w[w["crisis_prob"] >= threshold].sort_values("year")
+            captured = 1 if not w_hit.empty else 0
+            first_warn_year = int(w_hit["year"].iloc[0]) if captured else np.nan
+            lead_time = int(start - first_warn_year) if captured else np.nan
+
+            out_rows.append({
+                "country": c,
+                "crisis_start": int(start),
+                "crisis_end": int(end),
+                "warning_window": f"{warn_start} to {warn_end}",
+                "captured": int(captured),
+                "first_warning_year": first_warn_year,
+                "lead_time_years": lead_time,
+            })
+    return pd.DataFrame(out_rows)
+
+def confusion_heatmap(cm: np.ndarray, title: str = "Confusion matrix"):
+    if ALTAIR_OK:
+        df = pd.DataFrame(cm, index=["Actual 0", "Actual 1"], columns=["Pred 0", "Pred 1"]).reset_index()
+        long = df.melt(id_vars="index", var_name="pred", value_name="count").rename(columns={"index": "actual"})
+        chart = alt.Chart(long).mark_rect().encode(
+            x=alt.X("pred:N", title=None),
+            y=alt.Y("actual:N", title=None),
+            color=alt.Color("count:Q"),
+            tooltip=["actual:N", "pred:N", "count:Q"]
+        ).properties(height=220, title=title)
+        text = alt.Chart(long).mark_text().encode(
+            x="pred:N", y="actual:N", text="count:Q"
+        )
+        st.altair_chart(chart + text, use_container_width=True)
+    else:
+        fig, ax = plt.subplots(figsize=(4.2, 3.0))
+        ax.imshow(cm)
+        ax.set_xticks([0, 1]); ax.set_xticklabels(["Pred 0", "Pred 1"])
+        ax.set_yticks([0, 1]); ax.set_yticklabels(["Actual 0", "Actual 1"])
+        for i in range(2):
+            for j in range(2):
+                ax.text(j, i, str(cm[i, j]), ha="center", va="center")
+        ax.set_title(title)
+        st.pyplot(fig, clear_figure=True)
+
+def local_shap_top_drivers(selected_model, X_background: pd.DataFrame, X_row: pd.DataFrame, feature_names: list[str], top_k: int = 5):
+    """
+    Compute local SHAP for a single row using a small background.
+    Returns DataFrame of top drivers by |shap|.
+    """
+    explainer = shap.Explainer(selected_model, X_background)
+    sv = explainer(X_row)
+    vals = sv.values
+    if vals.ndim == 3:
+        vals = vals[:, :, 1]
+    v = vals[0]
+    df = pd.DataFrame({"Feature": feature_names, "shap": v, "abs": np.abs(v)})
+    df = df.sort_values("abs", ascending=False).head(top_k).reset_index(drop=True)
+    return df
+
+# ======================================================================
 # Train once (cached)
 # ======================================================================
 
@@ -420,9 +546,9 @@ def train_pipeline(jst_path: str):
     missing_features = [f"{f}_missing" for f in base_features]
     all_features = base_features + missing_features
 
-    train = df_target[df_target["year"] < 1970]
-    val   = df_target[(df_target["year"] >= 1970) & (df_target["year"] < 1990)]
-    test  = df_target[df_target["year"] >= 1990]
+    train = df_target[df_target["year"] < 1970].copy()
+    val   = df_target[(df_target["year"] >= 1970) & (df_target["year"] < 1990)].copy()
+    test  = df_target[df_target["year"] >= 1990].copy()
 
     X_train = train[all_features]
     X_val   = val[all_features]
@@ -459,6 +585,9 @@ def train_pipeline(jst_path: str):
     X_full_cont = scaler.transform(X_full[base_features])
     X_full_scaled = np.hstack([X_full_cont, X_full[missing_features].values])
 
+    # Provide metadata for test rows for diagnostics (false alarms, etc.)
+    test_meta = test[["country", "year", "crisisJST", "target"]].copy().reset_index(drop=True)
+
     return {
         "df_target": df_target,
         "macro": macro,
@@ -475,6 +604,7 @@ def train_pipeline(jst_path: str):
         "y_test": y_test.to_numpy(),
         "X_full_scaled": X_full_scaled,
         "test_probs_by_model": test_probs_by_model,
+        "test_meta": test_meta,   # <-- NEW
     }
 
 # ======================================================================
@@ -580,7 +710,7 @@ def render_shap_pie_altair(global_df, top_k=8, title="SHAP Feature Impact Share 
 
     st.altair_chart(pie + labels, use_container_width=True)
 
-def render_top6_bar(global_df, top_n=6, title="Top 6 drivers (mean |SHAP|)"):
+def render_top6_bar(global_df, top_n=6, title="Top drivers (mean |SHAP|)"):
     top = global_df.head(top_n).copy()
     top = top.iloc[::-1]
     if ALTAIR_OK:
@@ -622,6 +752,7 @@ Xs_test = bundle["Xs_test"]
 y_test = bundle["y_test"]
 X_full_scaled = bundle["X_full_scaled"]
 test_probs_by_model = bundle["test_probs_by_model"]
+test_meta = bundle["test_meta"]
 
 # ======================================================================
 # SIDEBAR CONTROLS
@@ -659,17 +790,20 @@ st.sidebar.subheader("🧠 SHAP (Tab 1)")
 shap_sample_n = st.sidebar.slider("SHAP sample size", 50, 400, 150, 25)
 
 # ======================================================================
-# PREPARE RISK DF
+# PREPARE RISK DF (full + filtered)
 # ======================================================================
 
-risk_df = df_target[
-    (df_target["country"].isin(risk_countries)) &
-    (df_target["year"] >= from_year) &
-    (df_target["year"] <= to_year)
-].copy()
+# Full risk series (for event-level evaluation & local SHAP lookup)
+risk_full = df_target.copy()
+risk_full_scaled = X_full_scaled[risk_full.index.to_numpy()]
+risk_full["crisis_prob"] = selected_model.predict_proba(risk_full_scaled)[:, 1]
 
-risk_scaled = X_full_scaled[risk_df.index.to_numpy()]
-risk_df["crisis_prob"] = selected_model.predict_proba(risk_scaled)[:, 1]
+# Filtered for display
+risk_df = risk_full[
+    (risk_full["country"].isin(risk_countries)) &
+    (risk_full["year"] >= from_year) &
+    (risk_full["year"] <= to_year)
+].copy()
 
 crisis_years_df = (
     risk_df[risk_df["crisisJST"] == 1][["country", "year"]]
@@ -842,16 +976,17 @@ with top_row_right:
 # TABS
 # ======================================================================
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "📈 Crisis Risk",
     "📊 Model Results",
     "🧠 SHAP (Detailed)",
     "📂 Data Explorer",
-    "🧭 Behavioural Drivers (Explain-only)"
+    "🧭 Behavioural Drivers (Explain-only)",
+    "🧪 Evaluation (Dissertation)"
 ])
 
 # -----------------------------------------------------------------------------
-# TAB 1
+# TAB 1: Crisis risk
 with tab1:
     st.header("Crisis risk over time", divider="gray")
 
@@ -948,7 +1083,7 @@ with tab1:
 
     with right:
         st.markdown("### 🧠 SHAP Feature Importance")
-        st.caption("SHAP splits the prediction (relative to a baseline) across features. Bigger |SHAP| = bigger influence.")
+        st.caption("SHAP splits the prediction across features. Bigger |SHAP| = bigger influence.")
 
         try:
             global_shap = compute_shap_global(
@@ -959,61 +1094,45 @@ with tab1:
             )
 
             st.markdown("#### Pie: global impact share (mean |SHAP|)")
-            st.caption("Share of total mean(|SHAP|) across sampled test rows (global importance).")
-
             if ALTAIR_OK:
                 render_shap_pie_altair(global_shap, top_k=8)
             else:
-                top = global_shap.head(8).copy()
-                other = float(global_shap["share"].iloc[8:].sum()) if len(global_shap) > 8 else 0.0
-                if other > 0:
-                    top = pd.concat(
-                        [top, pd.DataFrame([{"Feature": "Other", "mean_abs": np.nan, "mean_signed": 0.0, "share": other}])],
-                        ignore_index=True
-                    )
-                plt.figure(figsize=(7, 6))
-                plt.pie(top["share"], labels=top["Feature"], autopct=lambda p: f"{p:.1f}%" if p >= 4 else "", startangle=90)
-                plt.title("SHAP Feature Impact Share (mean |SHAP|)")
-                st.pyplot(plt.gcf(), clear_figure=True)
-                st.info("Install `altair` for an interactive pie chart.")
+                st.dataframe(global_shap.head(10), use_container_width=True)
 
             st.write("")
-            st.markdown("#### SHAP explainability (right under the pie)")
-            st.markdown(
-                "- **Positive SHAP** → pushes predicted crisis risk **up**.\n"
-                "- **Negative SHAP** → pushes predicted crisis risk **down**.\n"
-                "- **mean(|SHAP|)** → global importance (how strongly a feature tends to matter overall).\n"
-                "- The pie uses **share of mean(|SHAP|)**, so it’s a **global feature influence** summary."
-            )
-
-            st.write("")
-            st.markdown("#### Top 6 SHAP drivers (graph + explanation)")
+            st.markdown("#### Top 6 SHAP drivers")
             render_top6_bar(global_shap, top_n=6, title="Top 6 drivers (mean |SHAP|)")
 
-            top6 = global_shap.head(6).copy()
-            st.markdown("**What the top 6 represent**")
-            st.markdown(
-                "- Ranked by **mean(|SHAP|)** over the sampled rows.\n"
-                "- The direction note uses **mean(SHAP)** (average sign)."
-            )
-            for _, row in top6.iterrows():
-                feat = str(row["Feature"])
-                dir_note = direction_arrow(float(row["mean_signed"]))
-                st.markdown(
-                    f"- **{feat}** — {dir_note}.  \n"
-                    f"  *Meaning:* {explain_feature(feat)}"
-                )
+            with st.expander("Local explanation: why is risk high in a specific year? (Top drivers)"):
+                csel = st.selectbox("Country (local drivers)", ["USA", "UK", "Canada"], index=0, key="local_country")
+                years = sorted(risk_full[risk_full["country"] == csel]["year"].unique().tolist())
+                ysel = st.selectbox("Year", years, index=len(years)-1, key="local_year")
 
-            with st.expander("Show SHAP importance table (top 25)"):
-                tmp = global_shap.copy()
-                tmp["share_pct"] = tmp["share"] * 100
-                st.dataframe(tmp.head(25), use_container_width=True)
+                row = risk_full[(risk_full["country"] == csel) & (risk_full["year"] == ysel)].copy()
+                if row.empty:
+                    st.info("No row found for that selection.")
+                else:
+                    idx = row.index[0]
+                    x_row = pd.DataFrame([X_full_scaled[idx]], columns=all_features)
+                    # small background to keep it fast
+                    bg_idx = risk_full.sample(n=min(250, len(risk_full)), random_state=42).index
+                    X_bg = pd.DataFrame(X_full_scaled[bg_idx], columns=all_features)
+
+                    try:
+                        drivers = local_shap_top_drivers(selected_model, X_bg, x_row, all_features, top_k=6)
+                        st.dataframe(drivers[["Feature", "shap"]], use_container_width=True)
+                        st.caption(
+                            "🧠 What this means: This lists the features pushing risk up/down for the selected country-year. "
+                            "Positive values push risk up; negative values push risk down."
+                        )
+                    except Exception:
+                        st.warning("Local SHAP failed for this model. Try Gradient Boosting / Random Forest.")
 
         except Exception:
             st.warning("SHAP could not be computed for this model. Try Gradient Boosting / Random Forest, or reduce SHAP sample size.")
 
 # -----------------------------------------------------------------------------
-# TAB 2
+# TAB 2: Model results
 with tab2:
     st.header("Model comparison (validation)", divider="gray")
     st.dataframe(results_df, use_container_width=True)
@@ -1035,13 +1154,23 @@ with tab2:
     st.write("")
     st.subheader("Confusion matrix (test)", divider="gray")
     cm = confusion_matrix(y_test, test_preds)
-    st.dataframe(
-        pd.DataFrame(cm, index=["Actual 0", "Actual 1"], columns=["Pred 0", "Pred 1"]),
-        use_container_width=True
-    )
+    confusion_heatmap(cm, title="Confusion matrix (test: 1990+)")
+
+    with st.expander("Show false-alarm years (flagged risk, but no crisis label)"):
+        meta = test_meta.copy()
+        meta["prob"] = test_probs
+        meta["pred"] = test_preds
+        # False alarms = predicted 1, actual target 0
+        fa = meta[(meta["pred"] == 1) & (meta["target"] == 0)].copy()
+        fa = fa.sort_values(["prob"], ascending=False)
+        st.dataframe(fa.head(60), use_container_width=True)
+        st.caption(
+            "🧾 What this means: These are years where the model would raise an alert, but the label says no crisis followed. "
+            "This is useful to discuss ‘false alarms’ in a policy setting."
+        )
 
 # -----------------------------------------------------------------------------
-# TAB 3
+# TAB 3: SHAP detailed
 with tab3:
     st.header("SHAP explainability (detailed)", divider="gray")
     st.markdown(
@@ -1050,7 +1179,7 @@ SHAP explains predictions by distributing the difference between the prediction 
 
 - **Positive SHAP** increases predicted crisis risk.
 - **Negative SHAP** decreases predicted crisis risk.
-- **Mean absolute SHAP** gives global importance (what the Tab 1 pie and Top-6 chart summarise).
+- **Mean absolute SHAP** gives global importance.
 """
     )
 
@@ -1075,12 +1204,12 @@ SHAP explains predictions by distributing the difference between the prediction 
             st.pyplot(plt.gcf(), clear_figure=True)
 
 # -----------------------------------------------------------------------------
-# TAB 4
+# TAB 4: Data explorer
 with tab4:
     st.header("Data explorer (processed dataset used for modelling)", divider="gray")
     show_cols = ["country", "year", "crisisJST", "target"] + all_features
     st.dataframe(
-        df_target[show_cols].sort_values(["country", "year"]).tail(150),
+        df_target[show_cols].sort_values(["country", "year"]).tail(200),
         use_container_width=True
     )
 
@@ -1133,7 +1262,6 @@ with tab5:
         proxy_col = proxy_options[proxy_label]
         beh2["out_lagged"] = beh2.groupby("country")[out_col].shift(-lag)
 
-        # One-line meaning under selectors
         with cL:
             st.caption(f"Proxy meaning: {explain_proxy_short(proxy_col)}")
             st.caption(f"Outcome meaning: {explain_outcome_short(out_col)}")
@@ -1267,3 +1395,104 @@ with tab5:
 
         st.divider()
         st.markdown("**Note:** Correlation ≠ causation. These charts are included to explain relationships and timing, not to train the model.")
+
+# -----------------------------------------------------------------------------
+# TAB 6: Evaluation (Dissertation)
+with tab6:
+    st.header("Evaluation & policy-style evidence (Dissertation)", divider="gray")
+    st.caption("These charts support dissertation evaluation: trade-offs, calibration, and event-level early warning.")
+
+    test_probs = test_probs_by_model[model_choice]
+    test_preds = (test_probs >= threshold).astype(int)
+
+    # 1) Threshold trade-off curve
+    st.subheader("1) Threshold trade-off (Precision/Recall/F1 vs threshold)", divider="gray")
+    tdf = threshold_curve_df(y_test, test_probs, step=0.01)
+
+    if ALTAIR_OK:
+        base = alt.Chart(tdf).encode(x=alt.X("threshold:Q", title="threshold"))
+        p_line = base.mark_line().encode(y=alt.Y("precision:Q", title="score"), tooltip=["threshold:Q", alt.Tooltip("precision:Q", format=".3f")])
+        r_line = base.mark_line().encode(y="recall:Q", tooltip=["threshold:Q", alt.Tooltip("recall:Q", format=".3f")])
+        f_line = base.mark_line().encode(y="f1:Q", tooltip=["threshold:Q", alt.Tooltip("f1:Q", format=".3f")])
+        rule = alt.Chart(pd.DataFrame({"threshold":[threshold]})).mark_rule(strokeDash=[6,4]).encode(x="threshold:Q")
+        st.altair_chart((p_line + r_line + f_line + rule).properties(height=280).interactive(), use_container_width=True)
+    else:
+        fig, ax = plt.subplots(figsize=(7.5, 3.0))
+        ax.plot(tdf["threshold"], tdf["precision"], label="precision")
+        ax.plot(tdf["threshold"], tdf["recall"], label="recall")
+        ax.plot(tdf["threshold"], tdf["f1"], label="f1")
+        ax.axvline(threshold, linestyle="--")
+        ax.set_xlabel("threshold"); ax.set_ylabel("score"); ax.legend()
+        st.pyplot(fig, clear_figure=True)
+
+    st.caption(
+        "🧠 What this means: Lower thresholds raise more alerts (higher recall, lower precision). "
+        "Higher thresholds raise fewer alerts (higher precision, lower recall). The dashed line shows your chosen threshold."
+    )
+
+    # 2) Calibration plot
+    st.subheader("2) Calibration (Reliability): predicted risk vs observed crisis frequency", divider="gray")
+    cdf = calibration_df(y_test, test_probs, n_bins=10)
+
+    if cdf.empty:
+        st.info("Not enough data to compute calibration.")
+    else:
+        if ALTAIR_OK:
+            line = alt.Chart(cdf).mark_line(point=True).encode(
+                x=alt.X("p_mean:Q", title="mean predicted probability"),
+                y=alt.Y("y_rate:Q", title="observed crisis rate"),
+                tooltip=[alt.Tooltip("p_mean:Q", format=".3f"), alt.Tooltip("y_rate:Q", format=".3f"), "count:Q"]
+            )
+            diag = alt.Chart(pd.DataFrame({"x":[0,1], "y":[0,1]})).mark_line(strokeDash=[6,4], opacity=0.7).encode(
+                x="x:Q", y="y:Q"
+            )
+            st.altair_chart((diag + line).properties(height=320).interactive(), use_container_width=True)
+        else:
+            fig, ax = plt.subplots(figsize=(6.5, 3.0))
+            ax.plot([0,1], [0,1], linestyle="--")
+            ax.plot(cdf["p_mean"], cdf["y_rate"], marker="o")
+            ax.set_xlabel("mean predicted probability"); ax.set_ylabel("observed crisis rate")
+            st.pyplot(fig, clear_figure=True)
+
+        st.caption(
+            "🧠 What this means: If the model says ‘0.30 risk’, calibration checks whether crises actually happen about 30% of the time at that level. "
+            "The closer to the diagonal line, the more trustworthy the probabilities are."
+        )
+
+    # 3) Event-level early warning capture
+    st.subheader("3) Event-level early warning (did we warn before crisis episodes?)", divider="gray")
+    window_left = st.slider("Warning window start (years before crisis)", 1, 5, 2, 1, key="ew_left")
+    window_right = st.slider("Warning window end (years before crisis)", 1, 3, 1, 1, key="ew_right")
+
+    if window_left <= window_right:
+        st.warning("Warning window must be like t-2 to t-1 (start > end). Increase the start slider.")
+    else:
+        ev = event_level_early_warning(risk_full, threshold=threshold, window=(window_left, window_right))
+        if ev.empty:
+            st.info("No crisis episodes detected to evaluate.")
+        else:
+            # Summary
+            s = ev.groupby("country")["captured"].agg(["sum", "count"]).reset_index()
+            s["capture_rate"] = s["sum"] / s["count"]
+            st.dataframe(s, use_container_width=True)
+
+            if ALTAIR_OK:
+                st.altair_chart(
+                    alt.Chart(s).mark_bar().encode(
+                        x=alt.X("country:N", title=None),
+                        y=alt.Y("capture_rate:Q", title="capture rate", scale=alt.Scale(domain=[0,1])),
+                        tooltip=["country:N", "sum:Q", "count:Q", alt.Tooltip("capture_rate:Q", format=".2%")]
+                    ).properties(height=260).interactive(),
+                    use_container_width=True
+                )
+
+            with st.expander("Show episode-level details (lead time)"):
+                st.dataframe(ev.sort_values(["country", "crisis_start"]), use_container_width=True)
+
+            st.caption(
+                "🧠 What this means: A crisis is ‘captured’ if the model crosses the threshold inside the pre-crisis warning window. "
+                "Lead time tells how many years before the crisis the first warning occurred."
+            )
+
+    st.divider()
+    st.markdown("If you include Tab 6 screenshots in your dissertation, you can justify model quality using **trade-offs**, **probability reliability**, and **early-warning usefulness**.")
