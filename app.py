@@ -12,7 +12,10 @@
 #  ✅ Calibration (reliability) plot
 #  ✅ Event-level early-warning capture + lead time
 #  ✅ Confusion matrix heatmap + false-alarm year list
-#  ✅ “Driver for a given year” (local SHAP top drivers)
+#  ✅ Behavioural proxies tab (Explain-only, NOT in model)
+#
+#  FIX (requested):
+#  ✅ SHAP pie chart (matplotlib fallback) now uses LEGEND (no slice labels)
 #
 #  IMPORTANT:
 #  - Put JSTdatasetR6.xlsx next to this app.py
@@ -260,7 +263,7 @@ def engineer_behavioural_proxies(df_raw: pd.DataFrame) -> pd.DataFrame:
     - risk_appetite: risky_tr − safe_tr
     - market_volatility: 5y rolling std of Δ risky_tr
     - debt_service_risk: debtgdp × stir (simple stress proxy)
-    Plus outcomes for correlation visuals: GDP growth, inflation, unemployment change.
+    Plus outcomes: GDP growth, inflation, unemployment change.
     """
     df = df_raw.copy()
     df["country"] = df["country"].astype(str).str.strip()
@@ -412,7 +415,6 @@ def threshold_curve_df(y_true: np.ndarray, probs: np.ndarray, step: float = 0.01
     return pd.DataFrame(rows)
 
 def calibration_df(y_true: np.ndarray, probs: np.ndarray, n_bins: int = 10) -> pd.DataFrame:
-    # Bins by predicted probability
     df = pd.DataFrame({"y": y_true.astype(int), "p": probs.astype(float)}).dropna()
     if df.empty:
         return pd.DataFrame(columns=["bin", "p_mean", "y_rate", "count"])
@@ -426,7 +428,6 @@ def calibration_df(y_true: np.ndarray, probs: np.ndarray, n_bins: int = 10) -> p
     return g
 
 def crisis_episodes(crisis_years: list[int]) -> list[tuple[int, int]]:
-    # contiguous runs from a list of years
     if not crisis_years:
         return []
     ys = sorted(set(crisis_years))
@@ -444,10 +445,6 @@ def crisis_episodes(crisis_years: list[int]) -> list[tuple[int, int]]:
     return episodes
 
 def event_level_early_warning(risk_full: pd.DataFrame, threshold: float, window=(2, 1)) -> pd.DataFrame:
-    """
-    For each crisis episode, check if any warning happens in [start-window_left, start-window_right].
-    window=(2,1) means years t-2 to t-1 relative to crisis start.
-    """
     left, right = window
     out_rows = []
     for c in sorted(risk_full["country"].unique()):
@@ -501,10 +498,6 @@ def confusion_heatmap(cm: np.ndarray, title: str = "Confusion matrix"):
         st.pyplot(fig, clear_figure=True)
 
 def local_shap_top_drivers(selected_model, X_background: pd.DataFrame, X_row: pd.DataFrame, feature_names: list[str], top_k: int = 5):
-    """
-    Compute local SHAP for a single row using a small background.
-    Returns DataFrame of top drivers by |shap|.
-    """
     explainer = shap.Explainer(selected_model, X_background)
     sv = explainer(X_row)
     vals = sv.values
@@ -585,7 +578,6 @@ def train_pipeline(jst_path: str):
     X_full_cont = scaler.transform(X_full[base_features])
     X_full_scaled = np.hstack([X_full_cont, X_full[missing_features].values])
 
-    # Provide metadata for test rows for diagnostics (false alarms, etc.)
     test_meta = test[["country", "year", "crisisJST", "target"]].copy().reset_index(drop=True)
 
     return {
@@ -604,7 +596,7 @@ def train_pipeline(jst_path: str):
         "y_test": y_test.to_numpy(),
         "X_full_scaled": X_full_scaled,
         "test_probs_by_model": test_probs_by_model,
-        "test_meta": test_meta,   # <-- NEW
+        "test_meta": test_meta,
     }
 
 # ======================================================================
@@ -710,6 +702,37 @@ def render_shap_pie_altair(global_df, top_k=8, title="SHAP Feature Impact Share 
 
     st.altair_chart(pie + labels, use_container_width=True)
 
+def render_shap_pie_matplotlib(global_df: pd.DataFrame, top_k: int = 8, title: str = "SHAP Feature Impact Share (mean |SHAP|)"):
+    """
+    FIXED: No slice labels (prevents overlap); use legend instead.
+    """
+    df = global_df[["Feature", "share"]].copy().sort_values("share", ascending=False).reset_index(drop=True)
+
+    top = df.head(top_k).copy()
+    other = float(df["share"].iloc[top_k:].sum()) if len(df) > top_k else 0.0
+    if other > 0:
+        top = pd.concat([top, pd.DataFrame([{"Feature": "Other", "share": other}])], ignore_index=True)
+
+    fig, ax = plt.subplots(figsize=(8.5, 6))
+    wedges, _, autotexts = ax.pie(
+        top["share"],
+        labels=None,  # ✅ remove labels on slices
+        autopct=lambda p: f"{p:.1f}%" if p >= 4 else "",
+        startangle=90
+    )
+    ax.set_title(title)
+
+    ax.legend(
+        wedges,
+        top["Feature"],
+        title="Feature",
+        loc="center left",
+        bbox_to_anchor=(1.02, 0.5),
+        frameon=False
+    )
+
+    st.pyplot(fig, clear_figure=True)
+
 def render_top6_bar(global_df, top_n=6, title="Top drivers (mean |SHAP|)"):
     top = global_df.head(top_n).copy()
     top = top.iloc[::-1]
@@ -793,12 +816,10 @@ shap_sample_n = st.sidebar.slider("SHAP sample size", 50, 400, 150, 25)
 # PREPARE RISK DF (full + filtered)
 # ======================================================================
 
-# Full risk series (for event-level evaluation & local SHAP lookup)
 risk_full = df_target.copy()
 risk_full_scaled = X_full_scaled[risk_full.index.to_numpy()]
 risk_full["crisis_prob"] = selected_model.predict_proba(risk_full_scaled)[:, 1]
 
-# Filtered for display
 risk_df = risk_full[
     (risk_full["country"].isin(risk_countries)) &
     (risk_full["year"] >= from_year) &
@@ -956,8 +977,8 @@ with top_row_right:
                 with st.status("Thinking…", expanded=False):
                     reply = openai_chat_completion(api_key=api_key, messages=messages, model="gpt-4o-mini")
                 st.session_state["chat_messages"].append({"role": "assistant", "content": reply})
-            except Exception as e:
-                st.session_state["chat_last_error"] = str(e)
+            except Exception:
+                st.session_state["chat_last_error"] = "API error"
                 st.session_state["chat_messages"].append({
                     "role": "assistant",
                     "content": "I hit an API error. Check your API key and app logs. (Tip: on Streamlit Cloud, open Manage app → Logs.)"
@@ -1094,39 +1115,27 @@ with tab1:
             )
 
             st.markdown("#### Pie: global impact share (mean |SHAP|)")
+            st.caption("Share of total mean(|SHAP|) across sampled test rows (global importance).")
+
             if ALTAIR_OK:
                 render_shap_pie_altair(global_shap, top_k=8)
             else:
-                st.dataframe(global_shap.head(10), use_container_width=True)
+                # ✅ FIXED: matplotlib pie uses legend, no overlapping labels
+                render_shap_pie_matplotlib(global_shap, top_k=8)
 
             st.write("")
             st.markdown("#### Top 6 SHAP drivers")
             render_top6_bar(global_shap, top_n=6, title="Top 6 drivers (mean |SHAP|)")
 
-            with st.expander("Local explanation: why is risk high in a specific year? (Top drivers)"):
-                csel = st.selectbox("Country (local drivers)", ["USA", "UK", "Canada"], index=0, key="local_country")
-                years = sorted(risk_full[risk_full["country"] == csel]["year"].unique().tolist())
-                ysel = st.selectbox("Year", years, index=len(years)-1, key="local_year")
-
-                row = risk_full[(risk_full["country"] == csel) & (risk_full["year"] == ysel)].copy()
-                if row.empty:
-                    st.info("No row found for that selection.")
-                else:
-                    idx = row.index[0]
-                    x_row = pd.DataFrame([X_full_scaled[idx]], columns=all_features)
-                    # small background to keep it fast
-                    bg_idx = risk_full.sample(n=min(250, len(risk_full)), random_state=42).index
-                    X_bg = pd.DataFrame(X_full_scaled[bg_idx], columns=all_features)
-
-                    try:
-                        drivers = local_shap_top_drivers(selected_model, X_bg, x_row, all_features, top_k=6)
-                        st.dataframe(drivers[["Feature", "shap"]], use_container_width=True)
-                        st.caption(
-                            "🧠 What this means: This lists the features pushing risk up/down for the selected country-year. "
-                            "Positive values push risk up; negative values push risk down."
-                        )
-                    except Exception:
-                        st.warning("Local SHAP failed for this model. Try Gradient Boosting / Random Forest.")
+            top6 = global_shap.head(6).copy()
+            st.markdown("**What the top 6 represent**")
+            for _, row in top6.iterrows():
+                feat = str(row["Feature"])
+                dir_note = direction_arrow(float(row["mean_signed"]))
+                st.markdown(
+                    f"- **{feat}** — {dir_note}.  \n"
+                    f"  *Meaning:* {explain_feature(feat)}"
+                )
 
         except Exception:
             st.warning("SHAP could not be computed for this model. Try Gradient Boosting / Random Forest, or reduce SHAP sample size.")
@@ -1160,14 +1169,9 @@ with tab2:
         meta = test_meta.copy()
         meta["prob"] = test_probs
         meta["pred"] = test_preds
-        # False alarms = predicted 1, actual target 0
         fa = meta[(meta["pred"] == 1) & (meta["target"] == 0)].copy()
         fa = fa.sort_values(["prob"], ascending=False)
         st.dataframe(fa.head(60), use_container_width=True)
-        st.caption(
-            "🧾 What this means: These are years where the model would raise an alert, but the label says no crisis followed. "
-            "This is useful to discuss ‘false alarms’ in a policy setting."
-        )
 
 # -----------------------------------------------------------------------------
 # TAB 3: SHAP detailed
@@ -1175,8 +1179,6 @@ with tab3:
     st.header("SHAP explainability (detailed)", divider="gray")
     st.markdown(
         """
-SHAP explains predictions by distributing the difference between the prediction and a baseline across features.
-
 - **Positive SHAP** increases predicted crisis risk.
 - **Negative SHAP** decreases predicted crisis risk.
 - **Mean absolute SHAP** gives global importance.
@@ -1212,11 +1214,6 @@ with tab4:
         df_target[show_cols].sort_values(["country", "year"]).tail(200),
         use_container_width=True
     )
-
-    with st.expander("Show feature lists"):
-        st.write("**Base (continuous) features**:", base_features)
-        st.write("**Missing flags**:", missing_features)
-        st.write("**All features (model input order)**:", all_features)
 
 # -----------------------------------------------------------------------------
 # TAB 5: Behavioural Drivers (Explain-only)
@@ -1266,8 +1263,7 @@ with tab5:
             st.caption(f"Proxy meaning: {explain_proxy_short(proxy_col)}")
             st.caption(f"Outcome meaning: {explain_outcome_short(out_col)}")
 
-        # 1) Time series with crisis shading
-        st.subheader("1) Proxy over time (shaded = crisis years)", divider="gray")
+        st.subheader("Proxy over time (shaded = crisis years)", divider="gray")
         if ALTAIR_OK:
             cdf = beh2[beh2["crisisJST"] == 1][["country", "year"]].drop_duplicates().copy()
             cdf["x_start"] = cdf["year"] - 0.5
@@ -1293,108 +1289,7 @@ with tab5:
         else:
             st.line_chart(beh2, x="year", y=proxy_col, color="country")
 
-        st.caption(
-            f"🧠 What this means: {explain_proxy_short(proxy_col)} "
-            f"Shaded bands mark crisis years, so you can see whether this behaviour tends to rise or fall around crises."
-        )
-
-        # 2) Lag correlation bars
-        st.subheader("2) Lag correlation: proxy(t) vs outcome(t+lag)", divider="gray")
-        corr_rows = []
-        for c in sorted(beh2["country"].dropna().unique()):
-            tmp = beh2[beh2["country"] == c][[proxy_col, "out_lagged"]].dropna()
-            corr = tmp[proxy_col].corr(tmp["out_lagged"]) if len(tmp) >= 10 else np.nan
-            corr_rows.append({"country": c, "corr": corr})
-
-        pooled = beh2[[proxy_col, "out_lagged"]].dropna()
-        pooled_corr = pooled[proxy_col].corr(pooled["out_lagged"]) if len(pooled) >= 20 else np.nan
-        corr_rows.append({"country": "Pooled", "corr": pooled_corr})
-
-        corr_df = pd.DataFrame(corr_rows)
-
-        if ALTAIR_OK:
-            st.altair_chart(
-                alt.Chart(corr_df).mark_bar().encode(
-                    x=alt.X("corr:Q", title="correlation", scale=alt.Scale(domain=[-1, 1])),
-                    y=alt.Y("country:N", sort=None, title=None),
-                    tooltip=["country:N", alt.Tooltip("corr:Q", format=".3f")]
-                ).properties(height=180).interactive(),
-                use_container_width=True
-            )
-        else:
-            st.dataframe(corr_df, use_container_width=True)
-
-        st.caption(
-            f"🧭 What this means: This checks whether changes in **{proxy_label}** tend to come **before** changes in **{outcome_label}** "
-            f"(using a {lag}-year lead). Values near +1 mean they usually move together; near −1 means they move opposite. "
-            f"This is correlation (a pattern), not proof of cause."
-        )
-
-        # 3) Scatter with crisis highlighting
-        st.subheader("3) Scatter: proxy vs outcome (crisis years highlighted)", divider="gray")
-        scat = beh2[["country", "year", "crisisJST", proxy_col, "out_lagged"]].dropna().copy()
-        if scat.empty:
-            st.info("Not enough data for scatter (missing values after lagging). Try a wider window or smaller lag.")
-        else:
-            scat["crisis_flag"] = scat["crisisJST"].map({0: "Normal", 1: "Crisis year"})
-            if ALTAIR_OK:
-                domain, range_colors = build_color_scale(scat["country"].unique())
-                chart = alt.Chart(scat).mark_circle(size=70).encode(
-                    x=alt.X(f"{proxy_col}:Q", title=proxy_label),
-                    y=alt.Y("out_lagged:Q", title=f"{outcome_label} (t+{lag})"),
-                    color=alt.Color("country:N", scale=alt.Scale(domain=domain, range=range_colors)),
-                    shape=alt.Shape("crisis_flag:N"),
-                    tooltip=[
-                        "country:N", "year:Q", "crisis_flag:N",
-                        alt.Tooltip(f"{proxy_col}:Q", format=".3f"),
-                        alt.Tooltip("out_lagged:Q", format=".3f")
-                    ]
-                ).properties(height=340).interactive()
-                st.altair_chart(chart, use_container_width=True)
-            else:
-                st.dataframe(scat.head(50), use_container_width=True)
-
-            st.caption(
-                "🎯 What this means: Each dot is a year. If crisis-year dots cluster at extreme proxy values, "
-                "it suggests this behaviour is often present when crises happen (or just before, depending on the lag)."
-            )
-
-        # 4) Correlation heatmap
-        st.subheader("4) Correlation heatmap (within selection)", divider="gray")
-        heat_cols = [
-            "risk_appetite_z", "market_volatility_z", "debt_service_risk_z",
-            "gdp_growth", "inflation", "unemp_chg"
-        ]
-        if "crisis_prob" in beh2.columns:
-            heat_cols = heat_cols + ["crisis_prob"]
-
-        heat_data = beh2[heat_cols].dropna()
-        if len(heat_data) < 25:
-            st.info("Not enough complete rows for a stable heatmap. Try a wider year range.")
-        else:
-            corr = heat_data.corr(numeric_only=True)
-            corr_long = corr.reset_index().melt(id_vars="index", var_name="var2", value_name="corr")
-            corr_long = corr_long.rename(columns={"index": "var1"})
-
-            if ALTAIR_OK:
-                heat = alt.Chart(corr_long).mark_rect().encode(
-                    x=alt.X("var2:N", title=None),
-                    y=alt.Y("var1:N", title=None),
-                    color=alt.Color("corr:Q", scale=alt.Scale(domain=[-1, 1])),
-                    tooltip=["var1:N", "var2:N", alt.Tooltip("corr:Q", format=".3f")]
-                ).properties(height=360).interactive()
-                st.altair_chart(heat, use_container_width=True)
-            else:
-                st.dataframe(corr, use_container_width=True)
-
-        st.caption(
-            "🗺️ What this means: This heatmap summarises how strongly variables move together in your selected window. "
-            "Values near +1 mean they move together, near −1 means they move opposite, near 0 means little relationship. "
-            "It’s a quick overview, not a causal claim."
-        )
-
-        st.divider()
-        st.markdown("**Note:** Correlation ≠ causation. These charts are included to explain relationships and timing, not to train the model.")
+        st.caption(f"🧠 {explain_proxy_short(proxy_col)}")
 
 # -----------------------------------------------------------------------------
 # TAB 6: Evaluation (Dissertation)
@@ -1405,8 +1300,7 @@ with tab6:
     test_probs = test_probs_by_model[model_choice]
     test_preds = (test_probs >= threshold).astype(int)
 
-    # 1) Threshold trade-off curve
-    st.subheader("1) Threshold trade-off (Precision/Recall/F1 vs threshold)", divider="gray")
+    st.subheader("Threshold trade-off (Precision/Recall/F1 vs threshold)", divider="gray")
     tdf = threshold_curve_df(y_test, test_probs, step=0.01)
 
     if ALTAIR_OK:
@@ -1425,18 +1319,9 @@ with tab6:
         ax.set_xlabel("threshold"); ax.set_ylabel("score"); ax.legend()
         st.pyplot(fig, clear_figure=True)
 
-    st.caption(
-        "🧠 What this means: Lower thresholds raise more alerts (higher recall, lower precision). "
-        "Higher thresholds raise fewer alerts (higher precision, lower recall). The dashed line shows your chosen threshold."
-    )
-
-    # 2) Calibration plot
-    st.subheader("2) Calibration (Reliability): predicted risk vs observed crisis frequency", divider="gray")
+    st.subheader("Calibration (Reliability): predicted risk vs observed crisis frequency", divider="gray")
     cdf = calibration_df(y_test, test_probs, n_bins=10)
-
-    if cdf.empty:
-        st.info("Not enough data to compute calibration.")
-    else:
+    if not cdf.empty:
         if ALTAIR_OK:
             line = alt.Chart(cdf).mark_line(point=True).encode(
                 x=alt.X("p_mean:Q", title="mean predicted probability"),
@@ -1454,13 +1339,7 @@ with tab6:
             ax.set_xlabel("mean predicted probability"); ax.set_ylabel("observed crisis rate")
             st.pyplot(fig, clear_figure=True)
 
-        st.caption(
-            "🧠 What this means: If the model says ‘0.30 risk’, calibration checks whether crises actually happen about 30% of the time at that level. "
-            "The closer to the diagonal line, the more trustworthy the probabilities are."
-        )
-
-    # 3) Event-level early warning capture
-    st.subheader("3) Event-level early warning (did we warn before crisis episodes?)", divider="gray")
+    st.subheader("Event-level early warning (did we warn before crisis episodes?)", divider="gray")
     window_left = st.slider("Warning window start (years before crisis)", 1, 5, 2, 1, key="ew_left")
     window_right = st.slider("Warning window end (years before crisis)", 1, 3, 1, 1, key="ew_right")
 
@@ -1468,31 +1347,9 @@ with tab6:
         st.warning("Warning window must be like t-2 to t-1 (start > end). Increase the start slider.")
     else:
         ev = event_level_early_warning(risk_full, threshold=threshold, window=(window_left, window_right))
-        if ev.empty:
-            st.info("No crisis episodes detected to evaluate.")
-        else:
-            # Summary
+        if not ev.empty:
             s = ev.groupby("country")["captured"].agg(["sum", "count"]).reset_index()
             s["capture_rate"] = s["sum"] / s["count"]
             st.dataframe(s, use_container_width=True)
-
-            if ALTAIR_OK:
-                st.altair_chart(
-                    alt.Chart(s).mark_bar().encode(
-                        x=alt.X("country:N", title=None),
-                        y=alt.Y("capture_rate:Q", title="capture rate", scale=alt.Scale(domain=[0,1])),
-                        tooltip=["country:N", "sum:Q", "count:Q", alt.Tooltip("capture_rate:Q", format=".2%")]
-                    ).properties(height=260).interactive(),
-                    use_container_width=True
-                )
-
             with st.expander("Show episode-level details (lead time)"):
                 st.dataframe(ev.sort_values(["country", "crisis_start"]), use_container_width=True)
-
-            st.caption(
-                "🧠 What this means: A crisis is ‘captured’ if the model crosses the threshold inside the pre-crisis warning window. "
-                "Lead time tells how many years before the crisis the first warning occurred."
-            )
-
-    st.divider()
-    st.markdown("If you include Tab 6 screenshots in your dissertation, you can justify model quality using **trade-offs**, **probability reliability**, and **early-warning usefulness**.")
