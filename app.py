@@ -14,7 +14,6 @@
 
 import os
 import json
-import math
 from pathlib import Path
 
 import streamlit as st
@@ -142,13 +141,18 @@ def load_data(jst_path: str):
     df = df.sort_values(["country", "year"])
     return df
 
+def _safe_series(df: pd.DataFrame, col: str) -> pd.Series:
+    return df[col] if col in df.columns else pd.Series(np.nan, index=df.index)
+
 def engineer_features(df):
     df = df.copy()
 
     if "crisisJST" not in df.columns:
         df["crisisJST"] = 0
 
-    df["leverage_risk"] = 1 / (df["lev"] + 0.01)
+    # Leverage risk (guard if lev missing)
+    lev = _safe_series(df, "lev").astype(float)
+    df["leverage_risk"] = 1 / (lev + 0.01)
 
     def expanding_z(df_inner, col):
         def z(s):
@@ -157,8 +161,8 @@ def engineer_features(df):
             return (s - mu) / (sd + 1e-9)
         return df_inner.groupby("country")[col].transform(z)
 
-    df["noncore_z"]  = expanding_z(df, "noncore")
-    df["ltd_z"]      = expanding_z(df, "ltd")
+    df["noncore_z"]  = expanding_z(df, "noncore") if "noncore" in df.columns else np.nan
+    df["ltd_z"]      = expanding_z(df, "ltd") if "ltd" in df.columns else np.nan
     df["leverage_z"] = expanding_z(df, "leverage_risk")
 
     df["banking_fragility"] = (
@@ -167,30 +171,38 @@ def engineer_features(df):
         0.3 * df["leverage_z"]
     )
 
-    df["hp_real"] = df["hpnom"] / (df["cpi"] + 1e-9)
+    hpnom = _safe_series(df, "hpnom").astype(float)
+    cpi   = _safe_series(df, "cpi").astype(float)
+    df["hp_real"] = hpnom / (cpi + 1e-9)
     df["hp_trend"] = df.groupby("country")["hp_real"].transform(
         lambda x: x.rolling(10, min_periods=5).mean()
     )
     df["housing_bubble"] = (df["hp_real"] - df["hp_trend"]) / (df["hp_trend"] + 1e-9)
 
-    df["real_credit"] = df["tloans"] / (df["cpi"] + 1e-9)
+    tloans = _safe_series(df, "tloans").astype(float)
+    df["real_credit"] = tloans / (cpi + 1e-9)
     df["credit_growth"] = df.groupby("country")["real_credit"].pct_change()
 
-    df["yield_curve"] = df["ltrate"] - df["stir"]
+    ltrate = _safe_series(df, "ltrate").astype(float)
+    stir   = _safe_series(df, "stir").astype(float)
+    df["yield_curve"] = ltrate - stir
 
     us_ltrate = (
         df[df["country"] == "USA"]
         .drop_duplicates("year")
         .set_index("year")["ltrate"]
         .to_dict()
-    )
+    ) if "ltrate" in df.columns else {}
     df["us_ltrate"] = df["year"].map(us_ltrate)
-    df["sovereign_spread"] = df["ltrate"] - df["us_ltrate"]
+    df["sovereign_spread"] = ltrate - df["us_ltrate"].astype(float)
 
-    df["money_gdp"] = df["money"] / (df["gdp"] + 1e-9)
+    money = _safe_series(df, "money").astype(float)
+    gdp   = _safe_series(df, "gdp").astype(float)
+    df["money_gdp"] = money / (gdp + 1e-9)
     df["money_expansion"] = df.groupby("country")["money_gdp"].pct_change()
 
-    df["ca_gdp"] = df["ca"] / (df["gdp"] + 1e-9)
+    ca = _safe_series(df, "ca").astype(float)
+    df["ca_gdp"] = ca / (gdp + 1e-9)
 
     base_features = [
         "housing_bubble", "credit_growth", "banking_fragility",
@@ -202,6 +214,69 @@ def engineer_features(df):
     df = df.replace([np.inf, -np.inf], np.nan)
 
     return df, base_features
+
+def engineer_behavioural_proxies(df_raw: pd.DataFrame) -> pd.DataFrame:
+    """
+    Behavioural proxies (EXPLAIN-ONLY, NOT fed into the model):
+    - risk_appetite: risky_tr − safe_tr
+    - market_volatility: 5y rolling std of Δ risky_tr
+    - debt_service_risk: debtgdp × stir (simple stress proxy)
+    Plus a few outcomes for correlation visuals: GDP growth, inflation, unemployment change.
+    """
+    df = df_raw.copy()
+    df["country"] = df["country"].astype(str).str.strip()
+    df = df[df["country"].isin(["USA", "UK", "Canada"])].copy()
+    df = df.sort_values(["country", "year"])
+
+    # Ensure crisis column exists
+    if "crisisJST" not in df.columns:
+        df["crisisJST"] = 0
+
+    # Outcomes (safe if cols missing)
+    gdp = _safe_series(df, "gdp").astype(float)
+    cpi = _safe_series(df, "cpi").astype(float)
+    unemp = _safe_series(df, "unemp").astype(float)
+
+    df["gdp_growth"] = df.groupby("country")["gdp"].pct_change() if "gdp" in df.columns else np.nan
+    df["inflation"]  = df.groupby("country")["cpi"].pct_change() if "cpi" in df.columns else np.nan
+    df["unemp_chg"]  = df.groupby("country")["unemp"].diff() if "unemp" in df.columns else np.nan
+
+    # Behavioural proxies
+    risky_tr = _safe_series(df, "risky_tr").astype(float)
+    safe_tr  = _safe_series(df, "safe_tr").astype(float)
+    stir     = _safe_series(df, "stir").astype(float)
+    debtgdp  = _safe_series(df, "debtgdp").astype(float)
+
+    df["risk_appetite"] = risky_tr - safe_tr
+
+    df["risky_tr_chg"] = df.groupby("country")["risky_tr"].diff() if "risky_tr" in df.columns else np.nan
+    df["market_volatility"] = (
+        df.groupby("country")["risky_tr_chg"]
+          .transform(lambda s: s.rolling(5, min_periods=3).std())
+        if "risky_tr" in df.columns else np.nan
+    )
+
+    df["debt_service_risk"] = debtgdp * stir
+
+    # Expanding z-score for comparability across long history
+    def expanding_z(df_inner, col):
+        def z(s):
+            mu = s.expanding().mean()
+            sd = s.expanding().std().replace(0, np.nan)
+            return (s - mu) / (sd + 1e-9)
+        return df_inner.groupby("country")[col].transform(z)
+
+    for c in ["risk_appetite", "market_volatility", "debt_service_risk"]:
+        df[f"{c}_z"] = expanding_z(df, c)
+
+    keep = [
+        "country", "year", "crisisJST",
+        "risk_appetite", "market_volatility", "debt_service_risk",
+        "risk_appetite_z", "market_volatility_z", "debt_service_risk_z",
+        "gdp_growth", "inflation", "unemp_chg"
+    ]
+    out = df[keep].replace([np.inf, -np.inf], np.nan).copy()
+    return out
 
 def clean_data(df, base_features):
     df = df.copy()
@@ -298,9 +373,14 @@ def train_pipeline(jst_path: str):
     df_raw = load_data(jst_path)
 
     # macro series for GDP + real house price charts (from JST raw)
-    macro = df_raw[["country", "year", "gdp", "hpnom", "cpi", "crisisJST"]].copy()
-    macro["house_price_real"] = macro["hpnom"] / (macro["cpi"] + 1e-9)
+    macro = df_raw[["country", "year", "gdp", "hpnom", "cpi", "crisisJST"]].copy() if all(
+        c in df_raw.columns for c in ["country", "year", "gdp", "hpnom", "cpi", "crisisJST"]
+    ) else df_raw[["country", "year", "crisisJST"]].copy()
+    macro["house_price_real"] = _safe_series(macro, "hpnom").astype(float) / (_safe_series(macro, "cpi").astype(float) + 1e-9)
     macro = macro.sort_values(["country", "year"])
+
+    # Behavioural (explain-only)
+    behavioural = engineer_behavioural_proxies(df_raw)
 
     df_feat, base_features = engineer_features(df_raw)
     df_clean = clean_data(df_feat, base_features)
@@ -351,6 +431,7 @@ def train_pipeline(jst_path: str):
     return {
         "df_target": df_target,
         "macro": macro,
+        "behavioural": behavioural,  # <-- NEW
         "base_features": base_features,
         "missing_features": missing_features,
         "all_features": all_features,
@@ -498,6 +579,7 @@ bundle = train_pipeline(str(JST_XLSX))
 
 df_target = bundle["df_target"]
 macro = bundle["macro"]
+behavioural = bundle["behavioural"]  # <-- NEW
 base_features = bundle["base_features"]
 missing_features = bundle["missing_features"]
 all_features = bundle["all_features"]
@@ -728,8 +810,8 @@ with top_row_right:
                 with st.status("Thinking…", expanded=False):
                     reply = openai_chat_completion(api_key=api_key, messages=messages, model="gpt-4o-mini")
                 st.session_state["chat_messages"].append({"role": "assistant", "content": reply})
-            except Exception as e:
-                st.session_state["chat_last_error"] = str(e)
+            except Exception:
+                st.session_state["chat_last_error"] = str(e) if "e" in locals() else "Unknown error"
                 st.session_state["chat_messages"].append({
                     "role": "assistant",
                     "content": "I hit an API error. Check your API key and app logs. (Tip: on Streamlit Cloud, open Manage app → Logs.)"
@@ -753,11 +835,12 @@ with top_row_right:
 # TABS
 # ======================================================================
 
-tab1, tab2, tab3, tab4 = st.tabs([
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "📈 Crisis Risk",
     "📊 Model Results",
     "🧠 SHAP (Detailed)",
-    "📂 Data Explorer"
+    "📂 Data Explorer",
+    "🧭 Behavioural Drivers (Explain-only)"
 ])
 
 # -----------------------------------------------------------------------------
@@ -998,3 +1081,162 @@ with tab4:
         st.write("**Base (continuous) features**:", base_features)
         st.write("**Missing flags**:", missing_features)
         st.write("**All features (model input order)**:", all_features)
+
+# -----------------------------------------------------------------------------
+# TAB 5: Behavioural Drivers (Explain-only)
+with tab5:
+    st.header("Behavioural drivers (Explain-only)", divider="gray")
+    st.caption("These variables are engineered for interpretation and visual insight. They are NOT used in the model pipeline.")
+
+    beh = behavioural[
+        (behavioural["country"].isin(risk_countries)) &
+        (behavioural["year"] >= from_year) &
+        (behavioural["year"] <= to_year)
+    ].copy()
+
+    if beh.empty:
+        st.warning("No behavioural data for the selected filters.")
+    else:
+        proxy_options = {
+            "Risk appetite (risky_tr − safe_tr)": "risk_appetite_z",
+            "Market volatility (5y rolling std of Δ risky_tr)": "market_volatility_z",
+            "Debt service risk (debtgdp × stir)": "debt_service_risk_z",
+        }
+        outcome_options = {
+            "GDP growth (Δ gdp)": "gdp_growth",
+            "Inflation (Δ cpi)": "inflation",
+            "Unemployment change (Δ unemp)": "unemp_chg",
+            "Model crisis probability (selected model)": "__MODEL_RISK__",
+        }
+
+        cL, cR = st.columns([0.45, 0.55], gap="large")
+        with cL:
+            proxy_label = st.selectbox("Select behavioural proxy", list(proxy_options.keys()), index=0)
+            outcome_label = st.selectbox("Select outcome", list(outcome_options.keys()), index=0)
+            lag = st.slider("Lag (years): correlate proxy(t) with outcome(t+lag)", 0, 3, 1, 1)
+
+            st.markdown("**How to read this tab**")
+            st.markdown(
+                "- **Time series** shows the proxy and highlights crisis years.\n"
+                "- **Lag correlation** checks whether proxy tends to lead outcomes.\n"
+                "- **Scatter** shows whether crisis years cluster at extremes.\n"
+                "- **Heatmap** summarises correlations among proxies & outcomes."
+            )
+
+        beh2 = beh.copy()
+        if outcome_options[outcome_label] == "__MODEL_RISK__":
+            tmp_risk = risk_df[["country", "year", "crisis_prob"]].copy()
+            beh2 = beh2.merge(tmp_risk, on=["country", "year"], how="left")
+            out_col = "crisis_prob"
+        else:
+            out_col = outcome_options[outcome_label]
+
+        proxy_col = proxy_options[proxy_label]
+        beh2["out_lagged"] = beh2.groupby("country")[out_col].shift(-lag)
+
+        # 1) Time series with crisis shading
+        st.subheader("1) Proxy over time (shaded = crisis years)", divider="gray")
+        if ALTAIR_OK:
+            cdf = beh2[beh2["crisisJST"] == 1][["country", "year"]].drop_duplicates().copy()
+            cdf["x_start"] = cdf["year"] - 0.5
+            cdf["x_end"] = cdf["year"] + 0.5
+
+            domain, range_colors = build_color_scale(beh2["country"].unique())
+
+            rect = alt.Chart(cdf).mark_rect(opacity=0.15).encode(
+                x="x_start:Q", x2="x_end:Q",
+                y=alt.value(-10), y2=alt.value(10),
+                color=alt.Color("country:N", scale=alt.Scale(domain=domain, range=range_colors), legend=None),
+            )
+
+            line = alt.Chart(beh2).mark_line().encode(
+                x=alt.X("year:Q", title="year"),
+                y=alt.Y(f"{proxy_col}:Q", title=proxy_label),
+                color=alt.Color("country:N", scale=alt.Scale(domain=domain, range=range_colors), legend=alt.Legend(title="country")),
+                tooltip=["country:N", "year:Q", alt.Tooltip(f"{proxy_col}:Q", format=".3f")],
+            )
+
+            st.altair_chart((rect + line).properties(height=320).interactive(), use_container_width=True)
+        else:
+            st.line_chart(beh2, x="year", y=proxy_col, color="country")
+
+        # 2) Lag correlation bars
+        st.subheader("2) Lag correlation: proxy(t) vs outcome(t+lag)", divider="gray")
+        corr_rows = []
+        for c in sorted(beh2["country"].dropna().unique()):
+            tmp = beh2[beh2["country"] == c][[proxy_col, "out_lagged"]].dropna()
+            corr = tmp[proxy_col].corr(tmp["out_lagged"]) if len(tmp) >= 10 else np.nan
+            corr_rows.append({"country": c, "corr": corr})
+
+        pooled = beh2[[proxy_col, "out_lagged"]].dropna()
+        pooled_corr = pooled[proxy_col].corr(pooled["out_lagged"]) if len(pooled) >= 20 else np.nan
+        corr_rows.append({"country": "Pooled", "corr": pooled_corr})
+
+        corr_df = pd.DataFrame(corr_rows)
+
+        if ALTAIR_OK:
+            st.altair_chart(
+                alt.Chart(corr_df).mark_bar().encode(
+                    x=alt.X("corr:Q", title="correlation", scale=alt.Scale(domain=[-1, 1])),
+                    y=alt.Y("country:N", sort=None, title=None),
+                    tooltip=["country:N", alt.Tooltip("corr:Q", format=".3f")]
+                ).properties(height=180).interactive(),
+                use_container_width=True
+            )
+        else:
+            st.dataframe(corr_df, use_container_width=True)
+
+        # 3) Scatter with crisis highlighting
+        st.subheader("3) Scatter: proxy vs outcome (crisis years highlighted)", divider="gray")
+        scat = beh2[["country", "year", "crisisJST", proxy_col, "out_lagged"]].dropna().copy()
+        if scat.empty:
+            st.info("Not enough data for scatter (missing values after lagging). Try a different window or lag.")
+        else:
+            scat["crisis_flag"] = scat["crisisJST"].map({0: "Normal", 1: "Crisis year"})
+            if ALTAIR_OK:
+                domain, range_colors = build_color_scale(scat["country"].unique())
+                chart = alt.Chart(scat).mark_circle(size=70).encode(
+                    x=alt.X(f"{proxy_col}:Q", title=proxy_label),
+                    y=alt.Y("out_lagged:Q", title=f"{outcome_label} (t+{lag})"),
+                    color=alt.Color("country:N", scale=alt.Scale(domain=domain, range=range_colors)),
+                    shape=alt.Shape("crisis_flag:N"),
+                    tooltip=[
+                        "country:N", "year:Q", "crisis_flag:N",
+                        alt.Tooltip(f"{proxy_col}:Q", format=".3f"),
+                        alt.Tooltip("out_lagged:Q", format=".3f")
+                    ]
+                ).properties(height=340).interactive()
+                st.altair_chart(chart, use_container_width=True)
+            else:
+                st.dataframe(scat.head(50), use_container_width=True)
+
+        # 4) Correlation heatmap
+        st.subheader("4) Correlation heatmap (within selection)", divider="gray")
+        heat_cols = [
+            "risk_appetite_z", "market_volatility_z", "debt_service_risk_z",
+            "gdp_growth", "inflation", "unemp_chg"
+        ]
+        if "crisis_prob" in beh2.columns:
+            heat_cols = heat_cols + ["crisis_prob"]
+
+        heat_data = beh2[heat_cols].dropna()
+        if len(heat_data) < 25:
+            st.info("Not enough complete rows for a stable heatmap. Try a wider year range.")
+        else:
+            corr = heat_data.corr(numeric_only=True)
+            corr_long = corr.reset_index().melt(id_vars="index", var_name="var2", value_name="corr")
+            corr_long = corr_long.rename(columns={"index": "var1"})
+
+            if ALTAIR_OK:
+                heat = alt.Chart(corr_long).mark_rect().encode(
+                    x=alt.X("var2:N", title=None),
+                    y=alt.Y("var1:N", title=None),
+                    color=alt.Color("corr:Q", scale=alt.Scale(domain=[-1, 1])),
+                    tooltip=["var1:N", "var2:N", alt.Tooltip("corr:Q", format=".3f")]
+                ).properties(height=360).interactive()
+                st.altair_chart(heat, use_container_width=True)
+            else:
+                st.dataframe(corr, use_container_width=True)
+
+        st.divider()
+        st.markdown("**Note:** Correlation ≠ causation. These charts are included to explain relationships and timing, not to train the model.")
