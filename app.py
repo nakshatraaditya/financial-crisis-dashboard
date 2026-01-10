@@ -1,29 +1,4 @@
-# ======================================================================
-#  FINANCIAL CRISIS EARLY WARNING SYSTEM – STREAMLIT DASHBOARD (FULL)
-#  + LLM POWERED CHATBOT "POPUP" (st.popover) that stays available across tabs
-#
-#  ✅ No upload UI anywhere
-#  ✅ Chatbot opens as a popup (popover) and uses OpenAI Chat Completions API
-#  ✅ Chat remembers conversation in st.session_state
-#  ✅ Chat gets LIVE dashboard context (model, threshold, metrics, top SHAP)
-#
-#  Includes (Dissertation-worthy evaluation visuals):
-#  ✅ Threshold trade-off curves (Precision/Recall/F1 vs threshold)
-#  ✅ Calibration (reliability) plot
-#  ✅ Event-level early-warning capture + lead time
-#  ✅ Confusion matrix heatmap + false-alarm year list
-#  ✅ Behavioural proxies tab (Explain-only, NOT in model)
-#
-#  FIX (requested):
-#  ✅ SHAP pie chart (matplotlib fallback) now uses LEGEND (no slice labels)
-#
-#  Includes (requested):
-#  ✅ Local SHAP (single-year explanation) in Tab 3
-#
-#  IMPORTANT:
-#  - Put JSTdatasetR6.xlsx next to this app.py
-#  - Add OPENAI_API_KEY in Streamlit Secrets OR environment variable
-# ======================================================================
+#Initial mock for the dashboard
 
 import os
 import json
